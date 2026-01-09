@@ -104,7 +104,8 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="get_simulation",
-            description="Get simulation results for a specific alpha",
+            description="Get simulation results for a specific alpha including performance metrics "
+                       "like Sharpe ratio, returns, turnover, fitness, and drawdown",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -114,20 +115,6 @@ async def list_tools() -> list[Tool]:
                     },
                 },
                 "required": ["alpha_id"],
-            },
-        ),
-        Tool(
-            name="check_expression",
-            description="Check if an alpha expression is valid without submitting it",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "expression": {
-                        "type": "string",
-                        "description": "The alpha expression to validate",
-                    },
-                },
-                "required": ["expression"],
             },
         ),
     ]
@@ -215,34 +202,26 @@ async def call_tool(name: str, arguments: Any) -> list[TextContent]:
         
         elif name == "get_simulation":
             alpha_id = arguments["alpha_id"]
-            logger.info(f"Getting details for alpha: {alpha_id}")
+            logger.info(f"Getting simulation details for alpha: {alpha_id}")
             
+            # Get alpha which contains simulation results
             alpha = client.get_alpha(alpha_id)
             
-            # Extract simulation metrics from alpha details
+            # Extract simulation-specific metrics from the alpha details
+            # The API returns alpha details which include simulation metrics
             result = {
                 "alpha_id": alpha_id,
-                "details": alpha,
-            }
-            
-            return [
-                TextContent(
-                    type="text",
-                    text=json.dumps(result, indent=2),
-                )
-            ]
-        
-        elif name == "check_expression":
-            expression = arguments["expression"]
-            logger.info(f"Checking expression: {expression}")
-            
-            # The API doesn't have a dedicated check endpoint
-            # We could submit a simulation and immediately check status
-            # For now, provide guidance
-            result = {
-                "expression": expression,
-                "note": "Expression validation requires submitting a simulation. "
-                       "Use submit_alpha to test the expression.",
+                "sharpe": alpha.get("sharpe"),
+                "returns": alpha.get("returns"),
+                "turnover": alpha.get("turnover"),
+                "fitness": alpha.get("fitness"),
+                "drawdown": alpha.get("drawdown"),
+                "margin": alpha.get("margin"),
+                "longCount": alpha.get("longCount"),
+                "shortCount": alpha.get("shortCount"),
+                "is_best": alpha.get("is_best"),
+                "expression": alpha.get("regular"),
+                "status": alpha.get("status"),
             }
             
             return [

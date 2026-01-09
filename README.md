@@ -7,8 +7,7 @@ A Model Context Protocol (MCP) server that provides integration with the WorldQu
 - **Submit Alpha**: Submit alpha expressions to WorldQuant Brain for simulation
 - **Get Alpha Details**: Retrieve information about specific alphas
 - **List Alphas**: View all alphas in your account with their status and metrics
-- **Get Simulation Results**: Access detailed simulation results including Sharpe ratio, returns, turnover, and fitness
-- **Check Expressions**: Validate alpha expressions before submission
+- **Get Simulation Results**: Access detailed simulation results including Sharpe ratio, returns, turnover, fitness, and drawdown
 
 ## Prerequisites
 
@@ -121,13 +120,6 @@ Get simulation results for a specific alpha.
 
 **Parameters:**
 - `alpha_id` (required): The ID of the alpha
-
-#### check_expression
-
-Check if an alpha expression is valid.
-
-**Parameters:**
-- `expression` (required): The alpha expression to validate
 
 ## Alpha Expression Examples
 
