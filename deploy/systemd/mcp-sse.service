@@ -1,0 +1,17 @@
+[Unit]
+Description=WorldQuant BRAIN MCP SSE Service
+After=network.target
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/project/world-quant-brain-mcp
+# Load environment variables from .env (optional)
+EnvironmentFile=/opt/project/world-quant-brain-mcp/.env
+ExecStart=/opt/project/world-quant-brain-mcp/.venv/bin/mcp run --transport sse main.py:mcp
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
