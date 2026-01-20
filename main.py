@@ -1718,10 +1718,10 @@ class BrainApiClient:
                 "name": name,
                 "color": color,
                 "tags": tags,
-                "descriptions": {
-                    "selection": selection_desc,
-                    "combo": combo_desc
-                }
+                # "descriptions": {
+                #     "selection": selection_desc,
+                #     "combo": combo_desc
+                # }
             }
             payload = {k: v for k, v in payload.items() if v is not None}
             
@@ -2677,7 +2677,7 @@ async def check_correlation(alpha_id: str) -> Dict[str, Any]:
 async def set_alpha_properties(alpha_id: str, name: Optional[str] = None, 
                                color: Optional[str] = None, tags: Optional[List[str]] = None,
                                selection_desc: str = "None", combo_desc: str = "None") -> Dict[str, Any]:
-    """Update alpha properties (name, color, tags, descriptions)."""
+    """Update alpha properties (name, color, tags, descriptions). color may be one of `RED` `GREEN` `YELLOW` `BLUE` `PURPLE`"""
     try:
         return await brain_client.set_alpha_properties(alpha_id, name, color, tags, selection_desc, combo_desc)
     except Exception as e:
