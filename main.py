@@ -45,6 +45,49 @@ import candidate_pool as cpool
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
+def archive_performance_comparison(
+    alpha_id: str, scope: str, payload: Dict[str, Any]
+) -> Dict[str, Any]:
+    """Atomically archive a non-empty comparison result without credentials."""
+    if not payload or payload.get("available") is False or payload.get("error"):
+        return payload
+
+    root = Path(
+        os.environ.get(
+            "BRAIN_PERFORMANCE_COMPARISON_ARCHIVE",
+            r"D:\wqb_tuzige\tracking\performance_comparison",
+        )
+    )
+    root.mkdir(parents=True, exist_ok=True)
+    saved_at = datetime.now().astimezone().isoformat(timespec="seconds")
+    timestamp = datetime.now().strftime("%Y%m%dT%H%M%S%f")
+    safe_alpha_id = "".join(
+        character if character.isalnum() or character in "-_" else "_"
+        for character in alpha_id
+    )
+    archive_path = root / f"{safe_alpha_id}-{timestamp}.json"
+    temporary_path = archive_path.with_suffix(".json.tmp")
+    record = {
+        "schema_version": 1,
+        "saved_at": saved_at,
+        "alpha_id": alpha_id,
+        "scope": scope,
+        "result": payload,
+    }
+    temporary_path.write_text(
+        json.dumps(record, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    os.replace(temporary_path, archive_path)
+    result = dict(payload)
+    result["_archive"] = {
+        "saved": True,
+        "path": str(archive_path),
+        "saved_at": saved_at,
+    }
+    return result
+
 # Pydantic models for type safety
 class AuthCredentials(BaseModel):
     email: EmailStr
@@ -3960,25 +4003,59 @@ class BrainApiClient:
                                      team_id: Optional[str] = None) -> Dict[str, Any]:
         """Get before-and-after performance comparison data for an alpha.
 
-        If a competition is provided, the competition-scoped endpoint is used;
-        otherwise the user's own (self) alpha endpoint is used.
+        BRAIN exposes this resource below the alpha's owning scope.  The old
+        ``/alphas/{id}/performance-comparison`` route now returns 404, so keep
+        the scope selection explicit instead of passing a team as a query
+        parameter to the personal endpoint.
+
+        Scope precedence is competition, team, then the authenticated user.
         """
         await self.ensure_authenticated()
 
         try:
-            params = {"teamId": team_id}
-            params = {k: v for k, v in params.items() if v is not None}
-
             if competition:
-                url = f"{self.base_url}/competitions/{competition}/alphas/{alpha_id}/before-and-after-performance"
+                owner_scope = f"competitions/{competition}"
+            elif team_id:
+                owner_scope = f"teams/{team_id}"
             else:
-                url = f"{self.base_url}/users/self/alphas/{alpha_id}/before-and-after-performance"
+                owner_scope = "users/self"
+
+            url = (
+                f"{self.base_url}/{owner_scope}/alphas/{alpha_id}/"
+                "before-and-after-performance"
+            )
 
             # The endpoint returns an empty body with a Retry-After header while
             # the comparison is being computed, then JSON once it is ready.
-            return await self._request_json_with_retries(
-                'GET', url, params=params, op_name="performance_comparison"
-            )
+            try:
+                payload = await self._request_json_with_retries(
+                    'GET', url, op_name="performance_comparison"
+                )
+                return archive_performance_comparison(
+                    alpha_id, owner_scope, payload
+                )
+            except requests.HTTPError as error:
+                response = error.response
+                if response is None or response.status_code != 400:
+                    raise
+
+                # BRAIN drops this pre-submission report after an alpha enters
+                # OS.  Translate only that known case; retain unexpected 400s.
+                details_response = await self._request(
+                    "GET", f"{self.base_url}/alphas/{alpha_id}"
+                )
+                details_response.raise_for_status()
+                details = details_response.json()
+                if details.get("stage") != "OS":
+                    raise
+                return {
+                    "available": False,
+                    "reason": "performance_comparison_is_pre_submission_only",
+                    "alpha_id": alpha_id,
+                    "stage": "OS",
+                    "status": details.get("status"),
+                    "dateSubmitted": details.get("dateSubmitted"),
+                }
         except Exception as e:
             self.log(f"Failed to get performance comparison: {str(e)}", "ERROR")
             raise
@@ -5792,7 +5869,17 @@ async def get_platform_setting_options() -> Dict[str, Any]:
 @mcp.tool()
 async def performance_comparison(alpha_id: str, competition: Optional[str] = None,
                                  team_id: Optional[str] = None) -> Dict[str, Any]:
-    """Get before-and-after performance comparison data for an alpha.
+    """Get the mandatory pre-submission comparison for an unsubmitted IS alpha.
+
+    Call and save this check before submission.  BRAIN does not retain it for
+    this API after an alpha moves to OS; an OS result means the report can no
+    longer be retrieved, not that the endpoint is broken.  This tool never uses
+    the removed legacy ``/alphas/{id}/performance-comparison`` route.
+
+    Every non-empty valid response is automatically archived under
+    ``D:\\wqb_tuzige\\tracking\\performance_comparison`` (override with
+    ``BRAIN_PERFORMANCE_COMPARISON_ARCHIVE``).  The returned ``_archive`` field
+    records whether and where it was saved.
 
     Args:
         alpha_id: The alpha ID (e.g. "A1wYQ2xd" or "XgpEr77l").
