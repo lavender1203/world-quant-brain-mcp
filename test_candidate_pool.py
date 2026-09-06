@@ -1,5 +1,5 @@
 """Behavioural test for candidate_pool against a fake BRAIN client."""
-import asyncio, json, os, sys, tempfile
+import asyncio, datetime as dt, json, os, sys, tempfile
 
 import pandas as pd
 
@@ -374,6 +374,115 @@ async def main():
     entries = cp.load_pool()["entries"]
     check("only the refreshed entry's number moved",
           entries["P"]["prod_corr"] == 0.33 and entries["Q"]["prod_corr"] == 0.20, entries)
+    os.environ["CANDIDATE_POOL_FILE"] = pool_file
+
+    print("\n[14] E1: a batch should finish as many pyramids as it can")
+    # analyst needs 3 (4 pooled), news needs 1 (1 pooled), 4 slots. Ranking by
+    # "farthest from lit" spent all 4 on analyst and lit ONE tower.
+    class CoverClient(FakeClient):
+        PYR = {"a1": "analyst", "a2": "analyst", "a3": "analyst", "a4": "analyst",
+               "n1": "news"}
+        SH = {"a1": 2.0, "a2": 1.9, "a3": 1.8, "a4": 1.7, "n1": 1.2}
+        async def get_alpha_details(self, aid):
+            pyr = self.PYR[aid]
+            return {"id": aid, "status": "UNSUBMITTED",
+                    "settings": {"instrumentType": "EQUITY", "region": "GBR",
+                                 "universe": "TOP700", "delay": 1},
+                    "metrics": {"sharpe": self.SH[aid]},
+                    "ra": {"pyramid_short": pyr, "failed_ra_count": 0},
+                    "pyramids": {"list": [{"name": f"GBR/D1/{pyr.upper()}", "multiplier": 1.5}]}}
+        async def get_mutual_correlation(self, ids, threshold=0.5, years=4):
+            return {"matrix": {a: {b: (1.0 if a == b else 0.05) for b in ids} for a in ids},
+                    "missing_pnl": []}
+        async def check_correlation(self, aid, ctype, thr, **kw):
+            return {"checks": {"production": {"max_correlation": 0.20}}}
+        async def get_pyramid_alphas(self, s=None, e=None):
+            # analyst 0 submitted (needs 3), news 2 submitted (needs 1)
+            return {"pyramids": {"GBR": {"D1": {"analyst": 0, "news": 2}}}}
+
+    pool_file = os.environ["CANDIDATE_POOL_FILE"]
+    os.environ["CANDIDATE_POOL_FILE"] = os.path.join(TMP, "pool_e1.json")
+    cov = CoverClient()
+    for aid in ("a1", "a2", "a3", "a4", "n1"):
+        r = await cp.add_candidate(cov, aid)
+        check(f"{aid} pooled", r["added"], r)
+    plan = await cp.submission_plan(cov, max_submissions=4, region="GBR", delay=1, target=3)
+    picked = [x["alpha_id"] for x in plan["plan"]]
+    check("the cheap 1-submission pyramid is taken", "n1" in picked, picked)
+    check("and analyst is still completed with the other 3 slots",
+          sorted(picked) == ["a1", "a2", "a3", "n1"], picked)
+    lights = {x["alpha_id"]: x["lights_pyramid"] for x in plan["plan"]}
+    check("both lightings are reported", lights.get("n1") and lights.get("a3"), lights)
+    # With only 3 slots, news (need 1) still fits and analyst (need 3) does not.
+    plan3 = await cp.submission_plan(cov, max_submissions=3, region="GBR", delay=1, target=3)
+    p3 = [x["alpha_id"] for x in plan3["plan"]]
+    check("a 3-slot batch still lights news first", p3[0] == "n1", p3)
+
+    print("\n[15] E3: today's submissions come out of the day's budget")
+    class CappedClient(CoverClient):
+        SUBMITTED_TODAY = 2
+        async def get_submitted_ids_since(self, since=None):
+            now = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+            rows = {f"s{i}": {"id": f"s{i}",
+                              "dateSubmitted": (now - dt.timedelta(minutes=5 * i)).isoformat()}
+                    for i in range(self.SUBMITTED_TODAY)}
+            return {"ids": list(rows), "rows": rows, "since": since, "pages": 1}
+
+    capped = CappedClient()
+    plan = await cp.submission_plan(capped, max_submissions=4, region="GBR", delay=1, target=3)
+    budget = plan["submission_budget"]
+    check("today's submissions are counted", budget["submitted_today"] == 2, budget)
+    check("the budget shrinks to match", budget["applied"] == 2, budget)
+    check("and the plan respects it", len(plan["plan"]) == 2, plan["plan"])
+    plan_full = await cp.submission_plan(capped, max_submissions=4, region="GBR", delay=1,
+                                         target=3, respect_daily_cap=False)
+    check("respect_daily_cap=false plans the full number",
+          len(plan_full["plan"]) == 4, plan_full["plan"])
+    capped.SUBMITTED_TODAY = 4
+    plan_none = await cp.submission_plan(capped, max_submissions=4, region="GBR", delay=1, target=3)
+    check("a used-up day plans nothing, and says why",
+          plan_none["plan"] == [] and "used up" in plan_none["reason"], plan_none)
+
+    print("\n[16] E2: a prod_corr measured before the newest submission is stale")
+    # Age the stored measurements: they were taken before today's submissions.
+    aged = cp.load_pool()
+    for entry in aged["entries"].values():
+        entry["prod_corr_checked_at"] = "2026-01-01T00:00:00+00:00"
+    cp.save_pool(aged)
+    plan = await cp.submission_plan(CappedClient(), max_submissions=4, region="GBR",
+                                    delay=1, target=3)
+    stale = {x["alpha_id"] for x in (plan["stale_prod_corr"] or [])}
+    check("every entry checked before that submission is flagged",
+          stale == {"a1", "a2", "a3", "a4", "n1"}, plan["stale_prod_corr"])
+    check("the note points at the refresh", "refresh_prod=true" in plan["note"], plan["note"])
+    check("staleness is a caveat, not a fabricated verdict",
+          plan["all_remaining_safe"] in (True, False, None), plan["all_remaining_safe"])
+
+    print("\n[17] F2: pooled entries with no pyramid are not a pyramid")
+    class NoPyramidClient(CoverClient):
+        async def get_alpha_details(self, aid):
+            d = await CoverClient.get_alpha_details(self, aid)
+            d["ra"]["pyramid_short"] = None
+            d["pyramids"] = {"list": []}
+            return d
+
+    os.environ["CANDIDATE_POOL_FILE"] = os.path.join(TMP, "pool_f2.json")
+    npc = NoPyramidClient()
+    for aid in ("a1", "a2"):
+        r = await cp.add_candidate(npc, aid)
+        check(f"{aid} pooled without a pyramid", r["added"], r)
+    cov2 = await cp.pyramid_coverage(npc, region="GBR", delay=1, target=3)
+    rows2 = {x["pyramid"]: x for x in cov2["rows"]}
+    check("the unclassified entries are reported", "unknown" in rows2, list(rows2))
+    check("as UNCLASSIFIED, not as a short pyramid",
+          rows2["unknown"]["status"] == "UNCLASSIFIED", rows2["unknown"])
+    check("and excluded from the pyramid totals",
+          cov2["totals"]["pyramids"] == len([r for r in cov2["rows"] if r["pyramid"] != "unknown"]),
+          cov2["totals"])
+    check("not_reachable does not count them",
+          cov2["totals"]["not_reachable"] <= cov2["totals"]["pyramids"], cov2["totals"])
+    check("but the count is surfaced",
+          cov2["totals"]["unclassified_pool_entries"] == 2, cov2["totals"])
     os.environ["CANDIDATE_POOL_FILE"] = pool_file
 
     print("\n[13] A3 (client): an uncomputable correlation is None, never 0")

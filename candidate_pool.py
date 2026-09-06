@@ -217,6 +217,18 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _parse_ts(value: Any) -> Optional[datetime]:
+    """Parse an ISO 8601 stamp (ours or BRAIN's) into an aware datetime, or None."""
+    if not value or not isinstance(value, str):
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
 # --------------------------------------------------------------------------- #
 # Alpha metadata extraction
 # --------------------------------------------------------------------------- #
@@ -621,6 +633,7 @@ def list_pool(
     region: Optional[str] = None,
     pyramid: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """Pooled candidates, grouped region -> pyramid, best Sharpe first inside each."""
     pool = load_pool()
     entries = pool.get("entries", {})
     rows = []
@@ -733,10 +746,28 @@ async def pyramid_coverage(
     rows = []
     lit = 0
     reachable = 0
+    counted = 0
     for cat in cats:
         sub = submitted.get(cat, 0)
         poo = pooled.get(cat, 0)
         need = max(0, target - sub)
+        if cat == "unknown":
+            # Pooled entries whose record carried no pyramid. They are NOT a
+            # pyramid, so they must not be counted as one (they used to show up
+            # as a permanently short 18th tower) — just reported so the missing
+            # metadata is visible.
+            rows.append({
+                "pyramid": cat,
+                "label": "Unclassified (no pyramid on the record)",
+                "submitted": sub,
+                "pool": poo,
+                "total": sub + poo,
+                "needed_submissions": None,
+                "status": "UNCLASSIFIED",
+                "counts_as_pyramid": False,
+            })
+            continue
+        counted += 1
         if need == 0:
             status = "OS_SUFFICIENT"
             lit += 1
@@ -760,12 +791,13 @@ async def pyramid_coverage(
         "scope": {"region": region, "delay": delay, "target_per_pyramid": target},
         "rows": rows,
         "totals": {
-            "pyramids": len(rows),
+            "pyramids": counted,
             "lit_by_submitted": lit,
             "reachable_with_pool": reachable,
-            "not_reachable": len(rows) - reachable,
+            "not_reachable": counted - reachable,
             "submitted_alphas": sum(submitted.values()),
             "pooled_alphas": sum(pooled.values()),
+            "unclassified_pool_entries": pooled.get("unknown", 0),
         },
         "note": (
             "A pyramid lights on SUBMITTED alphas only. 'reachable_with_pool' counts "
@@ -788,6 +820,7 @@ async def submission_plan(
     prod_threshold: float = DEFAULT_PROD_THRESHOLD,
     self_threshold: float = DEFAULT_SELF_THRESHOLD,
     resolve_conflicts: bool = False,
+    respect_daily_cap: bool = True,
     years: int = 4,
 ) -> Dict[str, Any]:
     """Choose today's submission batch and prove it is safe for the rest of the pool.
@@ -808,6 +841,13 @@ async def submission_plan(
     in ``conflicts`` with a recommended keep/drop. ``resolve_conflicts=True`` acts
     on that recommendation: it submits the higher-priority member and marks the
     loser ``sacrificed`` (it stays in the pool; removing it is your call).
+
+    Ranking asks "does this batch FINISH a pyramid", re-evaluated before every
+    pick — see ``priority``. ``max_submissions`` is treated as the day's budget:
+    with ``respect_daily_cap`` the alphas already submitted today are subtracted
+    from it (``submission_budget`` reports the arithmetic). Entries whose
+    ``prod_corr`` was measured before the newest submission are listed in
+    ``stale_prod_corr`` — that number can only have gone up since.
     """
     pool = load_pool()
     entries: Dict[str, Any] = pool.get("entries", {})
@@ -823,6 +863,31 @@ async def submission_plan(
     if not scoped:
         return {"plan": [], "reason": "no pool candidates in scope",
                 "scope": {"region": region, "delay": delay}}
+
+    # The daily cap is account-wide, so today's submissions are counted across
+    # every region — not just the scope being planned.
+    context = await _submission_context(client, entries, max_submissions)
+    stale_prod_corr = context.pop("stale_prod_corr", [])
+    slots_left_today = context.get("slots_left_today")
+    if respect_daily_cap and isinstance(slots_left_today, int):
+        budget = min(max_submissions, slots_left_today)
+    else:
+        budget = max_submissions
+    submission_budget = dict(context, max_submissions=max_submissions,
+                             applied=budget, respect_daily_cap=respect_daily_cap)
+    if budget <= 0:
+        return {
+            "scope": {"region": region, "delay": delay, "max_submissions": max_submissions,
+                      "target_per_pyramid": target},
+            "plan": [],
+            "plan_size": 0,
+            "reason": (f"today's submission budget is used up "
+                       f"({context.get('submitted_today')} of {max_submissions} submitted)"),
+            "submission_budget": submission_budget,
+            "stale_prod_corr": stale_prod_corr or None,
+            "note": "Nothing to plan until the daily cap resets. "
+                    "Pass respect_daily_cap=false to plan anyway.",
+        }
 
     # Full pairwise matrix across the WHOLE pool (out-of-scope entries can still
     # be damaged by an in-scope submission, so they must be considered too).
@@ -850,18 +915,54 @@ async def submission_plan(
     )
     need_by_pyramid = {r["pyramid"]: r["needed_submissions"] for r in coverage["rows"]}
 
-    def priority(aid: str) -> Tuple[float, float]:
+    def _cat(aid: str) -> str:
+        return (scoped[aid].get("pyramid") or "unknown").lower()
+
+    def priority(aid: str, slots_left: int, remaining: Dict[str, int],
+                 available: Dict[str, int]) -> Tuple[int, int, float, float]:
+        """Rank a candidate for the NEXT slot. Higher is better.
+
+        A pyramid lights only when ``need`` more of its alphas are submitted, so
+        the value of a submission is 'does this batch finish a pyramid', not 'is
+        this pyramid far from lit'. Ranking by need descending (the previous rule)
+        did the opposite and burned a whole batch on one distant pyramid: with 4
+        slots, analyst needing 3 and news needing 1, all four went to analyst and
+        lit ONE pyramid where 3+1 would have lit two.
+
+        Tiers: 3 = can be finished inside this batch (cheapest need first),
+        2 = progress on an unlit pyramid, 1 = pyramid already lit.
+        """
         e = scoped[aid]
-        cat = (e.get("pyramid") or "unknown").lower()
-        need = need_by_pyramid.get(cat, 0)
+        cat = _cat(aid)
+        need = remaining.get(cat, 0)
+        pooled = available.get(cat, 0)
+        if need <= 0:
+            tier = 1
+        elif need <= slots_left and pooled >= need:
+            tier = 3
+        else:
+            tier = 2
         sharpe = (e.get("metrics") or {}).get("sharpe") or 0.0
         mult = e.get("pyramid_multiplier") or 1.0
-        # Higher is better: unmet pyramid need first, then multiplier, then Sharpe.
-        return (need * 1000 + mult * 10, sharpe)
+        # -need so the cheapest lighting comes first within a tier.
+        return (tier, -need, mult, sharpe)
 
-    ordered = sorted(scoped.keys(), key=lambda a: priority(a), reverse=True)
+    def availability(pending: Iterable[str]) -> Dict[str, int]:
+        """How many still-unprocessed candidates each pyramid has left."""
+        out: Dict[str, int] = {}
+        for aid in pending:
+            cat = _cat(aid)
+            out[cat] = out.get(cat, 0) + 1
+        return out
 
-    # Rank once; both the selection loop and the conflict recommendation use it.
+    # Static order at full budget: the priority a candidate has before anything
+    # is picked. Used for the conflict keep/drop recommendation, which must be a
+    # stable statement about two candidates rather than an artefact of ordering.
+    ordered = sorted(
+        scoped.keys(),
+        key=lambda a: priority(a, budget, need_by_pyramid, availability(scoped)),
+        reverse=True,
+    )
     rank = {aid: i for i, aid in enumerate(ordered)}
 
     selected: List[str] = []
@@ -914,9 +1015,17 @@ async def submission_plan(
     # the production gate is still satisfied.
     batch_gate = min(prod_threshold, self_threshold)
 
-    for aid in ordered:
-        if len(selected) >= max_submissions:
+    # Re-rank before every pick: a slot spent on a pyramid lowers that pyramid's
+    # remaining need, which is exactly the input the ranking depends on. Walking a
+    # single up-front ordering left `remaining_need` computed but never read.
+    pending = list(ordered)
+    while pending:
+        if len(selected) >= budget:
             break
+        slots_left = budget - len(selected)
+        avail = availability(pending)
+        pending.sort(key=lambda a: priority(a, slots_left, remaining_need, avail), reverse=True)
+        aid = pending.pop(0)
         if aid in sacrificed:
             # Already given up on to make room for a higher-priority candidate in
             # this very batch — submitting it anyway would recreate exactly the
@@ -975,8 +1084,7 @@ async def submission_plan(
                 sacrificed_for[loser] = aid
 
         selected.append(aid)
-        cat = (e.get("pyramid") or "unknown").lower()
-        remaining_need[cat] = max(0, remaining_need.get(cat, 0) - 1)
+        remaining_need[_cat(aid)] = max(0, remaining_need.get(_cat(aid), 0) - 1)
 
     # Report the post-submission state of everything left behind. ``still_safe``
     # is deliberately three-valued: True (proven under both gates), False (proven
@@ -1029,6 +1137,7 @@ async def submission_plan(
     plan = []
     for i, aid in enumerate(selected, 1):
         e = scoped[aid]
+        cat = _cat(aid)
         plan.append({
             "order": i,
             "alpha_id": aid,
@@ -1037,13 +1146,22 @@ async def submission_plan(
             "delay": e.get("delay"),
             "sharpe": (e.get("metrics") or {}).get("sharpe"),
             "prod_corr": e.get("prod_corr"),
+            "prod_corr_checked_at": e.get("prod_corr_checked_at"),
             "self_corr": e.get("self_corr"),
+            "pyramid_need_before": need_by_pyramid.get(cat, 0),
+            "lights_pyramid": (
+                cat != "unknown"
+                and need_by_pyramid.get(cat, 0) > 0
+                and remaining_need.get(cat, 0) == 0
+            ),
         })
 
     return {
         "scope": {"region": region, "delay": delay, "max_submissions": max_submissions,
                   "target_per_pyramid": target},
         "thresholds": {"prod": prod_threshold, "self": self_threshold},
+        "submission_budget": submission_budget,
+        "stale_prod_corr": stale_prod_corr or None,
         "plan": plan,
         "plan_size": len(plan),
         "skipped": skipped,
@@ -1063,6 +1181,12 @@ async def submission_plan(
             "The agent does NOT submit. This is a plan; submit manually. "
             "projected_prod_corr = max(current prod corr, |corr| vs the submitted batch). "
             + (
+                f"{len(stale_prod_corr)} candidate(s) carry a prod_corr measured before the "
+                f"newest submission ({context.get('newest_submission_at')}) — it can only have "
+                "risen; run pool_sync refresh_prod=true to re-measure. "
+                if stale_prod_corr else ""
+            )
+            + (
                 f"all_remaining_safe is null: {len(unprovable_for)} candidate(s) cannot be "
                 "proven safe because a correlation is missing (see unprovable_for / "
                 "pairwise_unavailable_for) — treat this as NOT safe until refreshed. "
@@ -1075,6 +1199,77 @@ async def submission_plan(
             )
         ).strip(),
     }
+
+
+async def _submission_context(
+    client: Any, entries: Dict[str, Any], daily_cap: int
+) -> Dict[str, Any]:
+    """Today's remaining submission slots + which stored prod_corr values are stale.
+
+    Both answers come from ONE submitted-alpha listing (the same 1-2 pages
+    ``sync_pool`` uses), because both are questions about what has been submitted
+    recently:
+
+    * the daily cap is a budget, and alphas already submitted today have spent
+      part of it — planning 4 when 2 are gone plans two submissions that cannot
+      happen;
+    * an entry's production correlation was measured against the production pool
+      as it stood at ``prod_corr_checked_at``; any submission after that moment
+      can only have raised it, so the stored number is a lower bound, not a fact.
+    """
+    out: Dict[str, Any] = {
+        "submitted_today": None,
+        "slots_left_today": None,
+        "newest_submission_at": None,
+        "stale_prod_corr": [],
+        "source": "unavailable",
+    }
+    if not hasattr(client, "get_submitted_ids_since"):
+        return out
+
+    now = datetime.now(timezone.utc)
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    checks = [_parse_ts(e.get("prod_corr_checked_at")) for e in entries.values()]
+    known_checks = [t for t in checks if t]
+    since = min([today_start] + known_checks)
+    try:
+        listing = await client.get_submitted_ids_since(since.isoformat())
+    except Exception as exc:  # noqa: BLE001 - planning must not fail over this
+        out["error"] = str(exc)
+        return out
+
+    rows = listing.get("rows") or {}
+    stamps = [_parse_ts((rows.get(aid) or {}).get("dateSubmitted"))
+              for aid in (listing.get("ids") or [])]
+    stamps = [t for t in stamps if t]
+    out["source"] = "submitted-list"
+
+    if stamps:
+        out["newest_submission_at"] = max(stamps).isoformat()
+        out["submitted_today"] = sum(1 for t in stamps if t >= today_start)
+        out["slots_left_today"] = max(0, daily_cap - out["submitted_today"])
+    elif not (listing.get("ids") or []):
+        # Nothing submitted in the window at all — the cap is untouched.
+        out["submitted_today"] = 0
+        out["slots_left_today"] = daily_cap
+    else:
+        # Ids without usable timestamps: refuse to guess how many were today.
+        out["note"] = "submission timestamps unavailable; daily cap not adjusted"
+
+    newest = max(stamps) if stamps else None
+    for aid, e in entries.items():
+        if e.get("prod_corr") is None:
+            continue                      # already reported as unknown, not stale
+        checked = _parse_ts(e.get("prod_corr_checked_at"))
+        if newest is not None and (checked is None or checked < newest):
+            out["stale_prod_corr"].append({
+                "alpha_id": aid,
+                "prod_corr": e.get("prod_corr"),
+                "prod_corr_checked_at": e.get("prod_corr_checked_at"),
+                "submissions_since": sum(
+                    1 for t in stamps if checked is None or t > checked),
+            })
+    return out
 
 
 async def _refresh_prod_corrs(client: Any, aids: Sequence[str]) -> Dict[str, Any]:

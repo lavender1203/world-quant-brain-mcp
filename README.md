@@ -598,7 +598,7 @@ BRAIN 每天只接受约 4 个 Regular Alpha 提交，但一轮研究往往能�
 | `pool_remove` | 移除候选（例如手工提交后） |
 | `pool_list` | 列出候选及其指标、相关性 |
 | `pool_pyramid_coverage` | 真实覆盖表：每座塔的「已提交 / 池 / 合计 / 还需提交几个」 |
-| `pool_submission_plan` | 排出今日提交批次，并**证明**它不会伤害池中其余候选 |
+| `pool_submission_plan` | 排出今日提交批次，并**证明**它不会伤害池中其余候选（含今日剩余配额与数据陈旧度）|
 | `pool_sync` | 刷新条目；已提交（status ACTIVE）的自动移出池 |
 
 四道闸（`pool_check` / `pool_add`）：
@@ -621,9 +621,34 @@ BRAIN 每天只接受约 4 个 Regular Alpha 提交，但一轮研究往往能�
 - `OS_SUFFICIENT` —— 已提交数达标，塔已点亮
 - `NEEDS_<n>_SUBMISSIONS_FROM_POOL` —— 池里候选够，交上去即可点亮
 - `SHORT_BY_<n>_CANDIDATES` —— 池子不够，还得继续挖
+- `UNCLASSIFIED` —— 记录里没有金字塔信息的池内候选。它不是一座塔，因此不计入
+  `totals.pyramids` / `not_reachable`，只在 `totals.unclassified_pool_entries` 报数
 
 塔只由**已提交**的 alpha 点亮（默认 `target=3`）；池是能把它推到位的队列，
 所以两者并排显示。省略 `region` / `delay` 即跨区域汇总。
+
+### 批次怎么排
+
+排序问题不是「哪座塔离点亮最远」，而是「这一批能**点完**哪几座塔」，且**每挑一个之前重排一次**
+（塔的剩余需求会随本批的选择下降）：
+
+| 档 | 含义 | 档内次序 |
+|---|---|---|
+| 3 | 剩余名额内能点完（`need ≤ 剩余名额` 且池里候选够）| `need` 小者优先 |
+| 2 | 点不完，但能推进未点亮的塔 | `need` 小者优先 |
+| 1 | 塔已点亮，纯粹加量 | —— |
+
+同档再比金字塔倍率、Sharpe。旧规则按 `need` 降序，4 个名额会全砸进最缺的那座塔：
+analyst 需 3、news 需 1 时只点亮 1 座，现在是 3+1 点亮 2 座（`plan` 里每条带
+`lights_pyramid` / `pyramid_need_before`）。
+
+**今日配额**：`max_submissions` 被当作当天的预算，已在今天提交的 alpha 会从中扣除
+（账号级，不分区域），算式在 `submission_budget` 里；配额用尽则返回空计划并说明原因，
+`respect_daily_cap=false` 可以按满额规划。
+
+**数据陈旧度**：条目里的生产相关性是在 `prod_corr_checked_at` 那一刻测的，之后任何提交
+只会把它抬高。晚于最近一次提交的条目列在 `stale_prod_corr` 里，并在 `note` 提示先跑
+`pool_sync refresh_prod=true`。这两件事共用**同一次**已提交列表请求。
 
 ### 提交批次的安全判定
 

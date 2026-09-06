@@ -8807,7 +8807,10 @@ async def pool_remove(alpha_ids: List[str]) -> Dict[str, Any]:
 @mcp.tool()
 async def pool_list(region: Optional[str] = None,
                     pyramid: Optional[str] = None) -> Dict[str, Any]:
-    """List pooled candidates with metrics and correlations, newest gates first."""
+    """List pooled candidates with metrics and correlations.
+
+    Grouped by region then pyramid, best Sharpe first within each group.
+    """
     try:
         return cpool.list_pool(region=region, pyramid=pyramid)
     except Exception as e:
@@ -8830,6 +8833,9 @@ async def pool_pyramid_coverage(
       OS_SUFFICIENT                    already lit
       NEEDS_<n>_SUBMISSIONS_FROM_POOL  pool has enough candidates queued
       SHORT_BY_<n>_CANDIDATES          research still needed
+      UNCLASSIFIED                     pooled entries with no pyramid on their
+                                       record; not a pyramid, so excluded from
+                                       the totals
 
     Omit region/delay to aggregate across all of them.
     """
@@ -8851,11 +8857,22 @@ async def pool_submission_plan(
     prod_threshold: float = 0.70,
     self_threshold: float = 0.70,
     resolve_conflicts: bool = False,
+    respect_daily_cap: bool = True,
 ) -> Dict[str, Any]:
     """Pick today's submission batch and prove it is safe for the rest of the pool.
 
-    Ranks candidates by unmet pyramid need, then pyramid multiplier, then Sharpe,
-    and takes up to ``max_submissions`` (BRAIN's daily regular-alpha cap is 4).
+    Ranking asks "does this batch FINISH a pyramid?", re-evaluated before every
+    pick: a pyramid that can be lit within the remaining slots comes first
+    (cheapest need first), then progress on an unlit pyramid, then already-lit
+    ones; ties go to pyramid multiplier, then Sharpe. Ranking by "farthest from
+    lit" instead would spend a whole batch on one tower and light nothing else.
+
+    ``max_submissions`` is the day's budget (BRAIN's regular-alpha cap is 4) and
+    alphas already submitted today are subtracted from it — see
+    ``submission_budget``; pass respect_daily_cap=false to plan the full number
+    anyway. ``stale_prod_corr`` lists entries whose stored production correlation
+    predates the newest submission (it can only have risen since); refresh them
+    with pool_sync refresh_prod=true.
     A candidate is skipped when it clashes with one already selected, or when
     submitting it would push a candidate left in the pool past a gate:
 
@@ -8882,6 +8899,7 @@ async def pool_submission_plan(
             max_submissions=max_submissions, region=region, delay=delay,
             target=target, prod_threshold=prod_threshold,
             self_threshold=self_threshold, resolve_conflicts=resolve_conflicts,
+            respect_daily_cap=respect_daily_cap,
         )
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
