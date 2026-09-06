@@ -5347,7 +5347,8 @@ class BrainApiClient:
         
         return {}
         
-    async def get_production_correlation(self, alpha_id: str) -> Dict[str, Any]:
+    async def get_production_correlation(self, alpha_id: str,
+                                         force_refresh: bool = False) -> Dict[str, Any]:
         """Get production correlation data for an alpha.
 
         Polls every 30 seconds for up to 1 hour to handle platform rate-limiting.
@@ -5367,11 +5368,15 @@ class BrainApiClient:
         Cached per alpha for BRAIN_CORRELATION_CACHE_TTL_SECONDS (default 300):
         asking the same alpha again within 5 minutes returns the stored answer
         (tagged ``cached: True`` with ``cache_age_seconds``) without a request
-        and without spending the slot.
+        and without spending the slot. ``force_refresh=True`` skips that cache —
+        use it right after a submission, which is exactly what makes a cached
+        number wrong.
         """
-        return await self._get_platform_correlation(alpha_id, 'prod', 'production')
+        return await self._get_platform_correlation(
+            alpha_id, 'prod', 'production', force_refresh=force_refresh)
 
-    async def get_power_pool_correlation(self, alpha_id: str) -> Dict[str, Any]:
+    async def get_power_pool_correlation(self, alpha_id: str,
+                                        force_refresh: bool = False) -> Dict[str, Any]:
         """Get Power Pool (PPA) correlation from the platform endpoint.
 
         Hits ``GET /alphas/{id}/correlations/power-pool`` — the same
@@ -5388,11 +5393,14 @@ class BrainApiClient:
         check returns ``correlation_busy`` with a retry_after instead of
         queueing. Results are cached per alpha for
         BRAIN_CORRELATION_CACHE_TTL_SECONDS (default 300) in its own key space,
-        separate from the prod cache for the same alpha.
+        separate from the prod cache for the same alpha; ``force_refresh=True``
+        bypasses it.
         """
-        return await self._get_platform_correlation(alpha_id, 'power-pool', 'power pool')
+        return await self._get_platform_correlation(
+            alpha_id, 'power-pool', 'power pool', force_refresh=force_refresh)
 
-    async def _get_platform_correlation(self, alpha_id: str, endpoint: str, label: str) -> Dict[str, Any]:
+    async def _get_platform_correlation(self, alpha_id: str, endpoint: str, label: str,
+                                        force_refresh: bool = False) -> Dict[str, Any]:
         """Shared lock-acquire/poll/release skeleton for the platform correlation
         endpoints (``prod`` and ``power-pool``). Both share one per-account lock."""
         await self.ensure_authenticated()
@@ -5402,7 +5410,7 @@ class BrainApiClient:
         # slot is requested, so a repeat check neither hits BRAIN nor spends the
         # one-per-interval slot — and never returns correlation_busy for an
         # answer we already have.
-        cached = self._get_cached_correlation(endpoint, alpha_id)
+        cached = None if force_refresh else self._get_cached_correlation(endpoint, alpha_id)
         if cached is not None:
             self.log(
                 f"[corr缓存] Alpha {alpha_id} {label} corr={cached.get('max')} "
@@ -6238,6 +6246,10 @@ class BrainApiClient:
         Returns the matrix, the single most-correlated pair, every pair at/above
         ``threshold``, whether all pairs are below it, and a greedy maximal
         subset whose members are all mutually below ``threshold``.
+
+        A pair with no overlapping history is reported as ``None`` in the matrix
+        and listed in ``unknown_pairs``; ``all_below_threshold`` is False while
+        any such pair exists, because an unknown correlation is not a safe one.
         """
         await self.ensure_authenticated()
 
@@ -6280,17 +6292,33 @@ class BrainApiClient:
         corr = rets.corr()
         cols = [c for c in present if c in corr.columns]
 
-        def cval(a: str, b: str) -> float:
+        def cval_raw(a: str, b: str) -> Optional[float]:
+            """None means NOT COMPUTABLE (no overlapping history), never 0.
+
+            A pair that reads 0.0 is 'proven uncorrelated'; a pair that could not
+            be computed is unknown, and callers gating on correlation (the
+            candidate pool) must be able to tell the two apart.
+            """
             try:
                 v = float(corr.loc[a, b])
-                return v if v == v else 0.0  # NaN -> 0
             except Exception:
-                return 0.0
+                return None
+            return v if v == v else None
+
+        def cval(a: str, b: str) -> float:
+            """Numeric view for ranking/greedy selection; unknown sorts as 0."""
+            v = cval_raw(a, b)
+            return v if v is not None else 0.0
 
         pairs = []
+        unknown_pairs = []
         for i in range(len(cols)):
             for j in range(i + 1, len(cols)):
-                pairs.append((cols[i], cols[j], cval(cols[i], cols[j])))
+                v = cval_raw(cols[i], cols[j])
+                if v is None:
+                    unknown_pairs.append({'a': cols[i], 'b': cols[j]})
+                else:
+                    pairs.append((cols[i], cols[j], v))
         pairs.sort(key=lambda x: -abs(x[2]))
 
         over = [{'a': a, 'b': b, 'correlation': round(c, 4)} for a, b, c in pairs if abs(c) >= threshold]
@@ -6316,7 +6344,15 @@ class BrainApiClient:
             if all(abs(cval(oid, k)) < threshold for k in kept):
                 kept.append(oid)
 
-        matrix = {a: {b: round(cval(a, b), 4) for b in cols} for a in cols}
+        # Unknown entries stay None in the matrix so a consumer cannot mistake
+        # "could not be computed" for "uncorrelated".
+        matrix = {}
+        for a in cols:
+            row = {}
+            for b in cols:
+                v = cval_raw(a, b)
+                row[b] = None if v is None else round(v, 4)
+            matrix[a] = row
 
         self.log(
             f"[mutual-corr] {len(cols)} alphas: max pair "
@@ -6333,7 +6369,9 @@ class BrainApiClient:
             'matrix': matrix,
             'max_pair': max_pair,
             'pairs_over_threshold': over,
-            'all_below_threshold': len(over) == 0,
+            # Not provable while any pair is uncomputable, so unknowns count against it.
+            'all_below_threshold': len(over) == 0 and not unknown_pairs,
+            'unknown_pairs': unknown_pairs,
             'max_mutually_below_subset': kept,
             'max_mutually_below_subset_size': len(kept),
             'missing_pnl': missing,
@@ -6387,7 +6425,9 @@ class BrainApiClient:
             'correlation_data': correlation_data,
         }
 
-    async def check_correlation(self, alpha_id: str, correlation_type: str = "production", threshold: float = 0.7) -> Dict[str, Any]:
+    async def check_correlation(self, alpha_id: str, correlation_type: str = "production",
+                                threshold: float = 0.7,
+                                force_refresh: bool = False) -> Dict[str, Any]:
         """ Only where all IS metrics PASS to Check alpha correlation, Check alpha correlation against production alphas, self alphas, power-pool alphas, or combinations.
 
         correlation_type: 'production' | 'self' | 'powerpool' | 'both'
@@ -6403,6 +6443,8 @@ class BrainApiClient:
         Each finished production / power-pool answer is cached per alpha for 5
         minutes (BRAIN_CORRELATION_CACHE_TTL_SECONDS), so re-checking the same
         alpha within that window is free and never reports correlation_busy.
+        ``force_refresh=True`` bypasses that cache (needed after a submission,
+        which moves everyone's production correlation).
         """
         await self.ensure_authenticated()
 
@@ -6428,9 +6470,11 @@ class BrainApiClient:
                     check_type = "powerpool"
                 if check_type in ("production", "powerpool"):
                     if check_type == "production":
-                        correlation_data = await self.get_production_correlation(alpha_id)
+                        correlation_data = await self.get_production_correlation(
+                            alpha_id, force_refresh=force_refresh)
                     else:
-                        correlation_data = await self.get_power_pool_correlation(alpha_id)
+                        correlation_data = await self.get_power_pool_correlation(
+                            alpha_id, force_refresh=force_refresh)
 
                     # Handle pending/data-not-yet-available case (super alphas, fresh simulations)
                     if correlation_data and correlation_data.get('status') == 'pending':
@@ -8444,22 +8488,29 @@ async def get_alpha_yearly_stats(alpha_id: str) -> Dict[str, Any]:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
 @mcp.tool()
-async def check_correlation(alpha_id: str) -> Dict[str, Any]:
+async def check_correlation(alpha_id: str, force_refresh: bool = False) -> Dict[str, Any]:
     """Check alpha correlation against production alphas, self alphas, or both.
 
     Does NOT include the Power Pool (PPA) correlation — use
     check_power_pool_correlation for that (platform call, shares the same
     per-account correlation lock as the production check here).
+
+    A finished production result is reused for 5 minutes, so re-asking is free.
+    Pass force_refresh=true ONLY after something was submitted (that is what
+    makes the cached number stale) — it re-queries and spends the account's
+    one-per-3-minutes correlation slot.
     """
     correlation_type = "both"
     threshold = 0.7
     try:
-        return _slim_check_correlation(await brain_client.check_correlation(alpha_id, correlation_type, threshold))
+        return _slim_check_correlation(await brain_client.check_correlation(
+            alpha_id, correlation_type, threshold, force_refresh=force_refresh))
     except Exception as e:
         return {"error": str(e)}
 
 @mcp.tool()
-async def check_power_pool_correlation(alpha_id: str, threshold: float = 0.5) -> Dict[str, Any]:
+async def check_power_pool_correlation(alpha_id: str, threshold: float = 0.5,
+                                      force_refresh: bool = False) -> Dict[str, Any]:
     """Check alpha correlation against YOUR submitted Power Pool Alphas (PPA) via the PLATFORM.
 
     WHEN TO USE: ONLY when the user explicitly says they are hunting PPA
@@ -8486,9 +8537,14 @@ async def check_power_pool_correlation(alpha_id: str, threshold: float = 0.5) ->
 
     Returns max_correlation, passes_check, and the top correlated Power Pool
     alpha records. An empty Power Pool yields max_correlation=0.0 (pass).
+
+    Results are cached per alpha for 5 minutes; force_refresh=true bypasses that
+    cache and spends the shared correlation slot (only worth it after a
+    submission changed the Power Pool).
     """
     try:
-        return _slim_check_correlation(await brain_client.check_correlation(alpha_id, "powerpool", threshold))
+        return _slim_check_correlation(await brain_client.check_correlation(
+            alpha_id, "powerpool", threshold, force_refresh=force_refresh))
     except Exception as e:
         return {"error": str(e)}
 
@@ -8713,7 +8769,7 @@ async def pool_add(
     force: bool = False,
     allow_diversity_fail: bool = False,
     prod_threshold: float = 0.70,
-    self_threshold: float = 0.50,
+    self_threshold: float = 0.70,
     mutual_threshold: float = 0.40,
     refresh_prod: bool = True,
 ) -> Dict[str, Any]:
@@ -8808,7 +8864,9 @@ async def pool_submission_plan(
 
     ``remaining_pool_after_batch`` lists that projection for every candidate left
     behind, and ``all_remaining_safe`` is the single answer to "will submitting
-    this batch break anything still queued?".
+    this batch break anything still queued?" — true / false / **null**, where
+    null means a correlation is missing so safety could not be proven (the ids
+    are in ``unprovable_for``). Treat null as unsafe until refreshed.
 
     If two pooled candidates are mutually exclusive (submitting either destroys
     the other), a purely protective plan would submit neither and stall forever.
@@ -8840,9 +8898,13 @@ async def pool_sync(refresh_prod: bool = False, refresh_details: bool = False) -
 
     ``refresh_details=true`` re-reads every entry's record instead (one request
     per entry); use it to pick up manual edits or platform-side deletions.
-    ``refresh_prod=true`` also re-queries production correlation per entry. That
-    endpoint is single-concurrency and slow, so it is off by default — use it
-    after you submit something, since submissions move everyone's numbers.
+    ``refresh_prod=true`` also re-queries production correlation per entry,
+    bypassing the 5-minute result cache (a submission is exactly what makes that
+    cache stale). The platform admits ONE correlation check per account per ~3
+    minutes, so a multi-entry pool cannot be fully refreshed in one call: the
+    sweep stops at the first busy answer and reports ``prod_refresh`` with
+    ``updated`` / ``busy`` / ``not_attempted`` / ``retry_after`` — call it again
+    after ``retry_after`` seconds to continue.
     """
     try:
         return await cpool.sync_pool(

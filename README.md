@@ -604,10 +604,17 @@ BRAIN 每天只接受约 4 个 Regular Alpha 提交，但一轮研究往往能�
 四道闸（`pool_check` / `pool_add`）：
 
 - 候选自身生产相关性 < `prod_threshold`（默认 0.70）
-- 候选自身自相关 < `self_threshold`（默认 0.70）
+- 候选自身自相关 < `self_threshold`（默认 0.70，与平台闸一致；`pool_check` /
+  `pool_add` / `pool_submission_plan` 三处默认值相同）
 - 与池内每个候选的 |相关性| < `prod_threshold` —— **安全闸**，硬性
 - 与池内每个候选的 |相关性| < `mutual_threshold`（默认 0.40）—— **多样性闸**，
   可用 `allow_diversity_fail=true` 单独豁免（永远不会豁免安全闸）
+
+**「算不出来」不等于「安全」**：任一相关性拿不到（PnL 缺失、相关性槽位被占导致
+生产相关性未知）都算**闸没过**，只能用 `force=true` 明确接受未经证明的配对；条目里
+存的是 `null` 而不是 0，规划时也不会被当成 0 来算。底层的
+`get_mutual_correlation` 对无重叠历史的配对返回 `null` 并列进 `unknown_pairs`，
+不再折成 0.0。
 
 ### 覆盖表状态
 
@@ -617,6 +624,20 @@ BRAIN 每天只接受约 4 个 Regular Alpha 提交，但一轮研究往往能�
 
 塔只由**已提交**的 alpha 点亮（默认 `target=3`）；池是能把它推到位的队列，
 所以两者并排显示。省略 `region` / `delay` 即跨区域汇总。
+
+### 提交批次的安全判定
+
+`pool_submission_plan` 的 `all_remaining_safe` 是**三值**的：
+
+- `true` —— 批次留下的每个候选都被证明仍在闸内
+- `false` —— 有候选会被顶出闸（详见 `remaining_pool_after_batch`）
+- `null` —— **证明不了**：某个相关性缺失（`unprovable_for` / `pairwise_unavailable_for`
+  列出是谁）。按不安全处理，先 `pool_sync refresh_prod=true` 补数据再规划
+
+批次内部的两两相关性要同时过**生产闸和自相关闸**（判据是
+`min(prod_threshold, self_threshold)`）：同一天提交的两个 alpha 会互相进入对方的
+自相关池，只看 0.7 会漏掉 0.5~0.7 这段。另外被 `resolve_conflicts` 放弃
+（`sacrificed`）的候选**不会**再出现在同一批 `plan` 里。
 
 ### 互斥候选的死锁
 
@@ -629,5 +650,14 @@ BRAIN 每天只接受约 4 个 Regular Alpha 提交，但一轮研究往往能�
 
 - 池文件存放于 `/app/config/candidate_pool.json`（compose 中的 `mcp_config` 卷，重建镜像不丢失），
   可用 `CANDIDATE_POOL_FILE` 覆盖。
+- **写入是加锁的**：所有改池的操作（add / remove / sync）在 `flock`
+  （`.candidate_pool.json.lock`）内完成"读→改→写"，锁只覆盖文件操作、不跨网络等待。
+  入池还带乐观校验：评估期间池子成员变了就重新评估，不会用旧快照覆盖别人的写入。
+- 池文件损坏时会被改名成 `candidate_pool.json.corrupt-<时间戳>` 保留原始字节，
+  之后才以空池继续；无法改名时 `save_pool` 直接拒绝写入。
+- `pool_sync refresh_prod=true` 会绕过 5 分钟结果缓存（提交后旧值必然是错的），
+  但平台每 3 分钟只放行一次相关性检查，所以**一次调用刷不完多条**：遇到第一个
+  `correlation_busy` 就停，`prod_refresh` 如实报出 `updated` / `busy` /
+  `not_attempted` / `retry_after`，等这个秒数后再调一次继续。
 - **这些工具不会提交任何 alpha**，只产出计划，提交由人工执行。
 - 测试：`python test_candidate_pool.py`（使用假客户端，不触网）。
