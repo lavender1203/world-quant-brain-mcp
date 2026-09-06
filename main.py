@@ -8,7 +8,7 @@ import json
 import time
 import asyncio
 import logging
-from typing import Dict, List, Optional, Any, Union, Sequence
+from typing import Dict, List, Optional, Any, Tuple, Union, Sequence
 import re
 import base64
 from bs4 import BeautifulSoup
@@ -1232,6 +1232,18 @@ class BrainApiClient:
             )
         except Exception:
             self._brain_correlation_min_interval_seconds = 180
+        # A finished platform correlation result is reused for this long, keyed by
+        # account+endpoint+alpha, so asking the same alpha twice in a row costs no
+        # request and does not burn the per-account slot. In-process dict (works
+        # even with Redis down) + Redis (reaches the other MCP processes).
+        try:
+            self._brain_correlation_cache_ttl_seconds = max(
+                0,
+                int(os.environ.get("BRAIN_CORRELATION_CACHE_TTL_SECONDS", "300")),
+            )
+        except Exception:
+            self._brain_correlation_cache_ttl_seconds = 300
+        self._corr_result_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
         self._os_pnl_pool_locks: Dict[str, asyncio.Lock] = {}
         self._os_pnl_pool_locks_guard = asyncio.Lock()
         self._os_pnl_pool_last_sync: Dict[str, Any] = {}
@@ -1489,20 +1501,90 @@ class BrainApiClient:
 
     _CORR_COOLDOWN_VALUE = "cooldown"
 
-    def _brain_correlation_lock_key(self) -> str:
-        """Per-account lock key. BRAIN's correlation concurrency limit is per
-        account, so multi-account deployments sharing one Redis must not block
-        each other."""
+    def _account_digest(self) -> Optional[str]:
+        """Short hash of the logged-in account's email, or None when unknown.
+        Used to shard every per-account key so multi-account deployments sharing
+        one Redis never touch each other's slots or cached results."""
         email = (self.auth_credentials or {}).get('email') if self.auth_credentials else None
         if not email:
             try:
                 email = (load_config().get('credentials') or {}).get('email')
             except Exception:
                 email = None
-        if email:
-            digest = hashlib.md5(email.strip().lower().encode()).hexdigest()[:12]
+        if not email:
+            return None
+        return hashlib.md5(email.strip().lower().encode()).hexdigest()[:12]
+
+    def _brain_correlation_lock_key(self) -> str:
+        """Per-account lock key. BRAIN's correlation concurrency limit is per
+        account, so multi-account deployments sharing one Redis must not block
+        each other."""
+        digest = self._account_digest()
+        if digest:
             return f"lock:brain_correlation:{digest}"
         return "lock:brain_correlation"
+
+    def _correlation_cache_key(self, endpoint: str, alpha_id: str) -> str:
+        """Per-account, per-endpoint, per-alpha key for a finished result.
+
+        Sharded by the same account digest as the slot key: two accounts sharing
+        one Redis must never read each other's correlations, and prod /
+        power-pool answers for one alpha are different payloads.
+        """
+        return f"corr_result:{self._account_digest() or 'default'}:{endpoint}:{alpha_id}"
+
+    def _get_cached_correlation(self, endpoint: str, alpha_id: str) -> Optional[Dict[str, Any]]:
+        """Return a still-fresh cached result for this alpha, or None.
+
+        Checked BEFORE the per-account slot is requested — a repeat question
+        about the same alpha must cost neither a BRAIN request nor the slot.
+        """
+        ttl = self._brain_correlation_cache_ttl_seconds
+        if ttl <= 0:
+            return None
+        key = self._correlation_cache_key(endpoint, alpha_id)
+        now = time.time()
+
+        entry = self._corr_result_cache.get(key)
+        if entry and now - entry[0] <= ttl:
+            return self._with_cache_age(entry[1], now - entry[0])
+        if entry:
+            self._corr_result_cache.pop(key, None)
+
+        cached = self._get_cached_data(key)
+        if isinstance(cached, dict) and isinstance(cached.get('payload'), dict):
+            age = max(0.0, now - float(cached.get('cached_at') or now))
+            if age <= ttl:
+                # Warm the in-process tier so a Redis eviction cannot lose it.
+                self._corr_result_cache[key] = (now - age, cached['payload'])
+                return self._with_cache_age(cached['payload'], age)
+        return None
+
+    def _set_cached_correlation(self, endpoint: str, alpha_id: str, corr_data: Dict[str, Any]):
+        """Cache a COMPLETED correlation result. Never called for pending /
+        correlation_busy answers — caching those would make them stick."""
+        ttl = self._brain_correlation_cache_ttl_seconds
+        if ttl <= 0 or not isinstance(corr_data, dict) or corr_data.get('max') is None:
+            return
+        key = self._correlation_cache_key(endpoint, alpha_id)
+        payload = {k: v for k, v in corr_data.items() if k not in ('cached', 'cache_age_seconds')}
+        self._corr_result_cache[key] = (time.time(), payload)
+        self._set_cached_data(key, {'cached_at': time.time(), 'payload': payload}, ttl=ttl)
+        # Keep the in-process tier from growing without bound in a long-lived
+        # process; expired entries are worthless anyway.
+        if len(self._corr_result_cache) > 512:
+            cutoff = time.time() - ttl
+            for k, (ts, _) in list(self._corr_result_cache.items()):
+                if ts < cutoff:
+                    self._corr_result_cache.pop(k, None)
+
+    @staticmethod
+    def _with_cache_age(corr_data: Dict[str, Any], age: float) -> Dict[str, Any]:
+        """Copy of a cached result tagged with how stale it is."""
+        out = dict(corr_data)
+        out['cached'] = True
+        out['cache_age_seconds'] = int(age)
+        return out
 
     def _brain_correlation_max_wait(self) -> int:
         """Total polling budget for one platform correlation check."""
@@ -5281,6 +5363,11 @@ class BrainApiClient:
         ``correlation_busy`` immediately instead of queueing behind it. The gate
         is held in Redis AND in a host-level file lock, so it holds across
         processes and survives a Redis outage.
+
+        Cached per alpha for BRAIN_CORRELATION_CACHE_TTL_SECONDS (default 300):
+        asking the same alpha again within 5 minutes returns the stored answer
+        (tagged ``cached: True`` with ``cache_age_seconds``) without a request
+        and without spending the slot.
         """
         return await self._get_platform_correlation(alpha_id, 'prod', 'production')
 
@@ -5299,7 +5386,9 @@ class BrainApiClient:
         BRAIN_CORRELATION_MIN_INTERVAL_SECONDS (default 180), enforced across
         processes, so a concurrent — or merely too-soon — prod OR power-pool
         check returns ``correlation_busy`` with a retry_after instead of
-        queueing.
+        queueing. Results are cached per alpha for
+        BRAIN_CORRELATION_CACHE_TTL_SECONDS (default 300) in its own key space,
+        separate from the prod cache for the same alpha.
         """
         return await self._get_platform_correlation(alpha_id, 'power-pool', 'power pool')
 
@@ -5307,6 +5396,21 @@ class BrainApiClient:
         """Shared lock-acquire/poll/release skeleton for the platform correlation
         endpoints (``prod`` and ``power-pool``). Both share one per-account lock."""
         await self.ensure_authenticated()
+
+        # A finished result for this alpha is reused for
+        # BRAIN_CORRELATION_CACHE_TTL_SECONDS (default 300). Checked before the
+        # slot is requested, so a repeat check neither hits BRAIN nor spends the
+        # one-per-interval slot — and never returns correlation_busy for an
+        # answer we already have.
+        cached = self._get_cached_correlation(endpoint, alpha_id)
+        if cached is not None:
+            self.log(
+                f"[corr缓存] Alpha {alpha_id} {label} corr={cached.get('max')} "
+                f"(缓存命中, {cached.get('cache_age_seconds')}s 前获取, "
+                f"{self._brain_correlation_cache_ttl_seconds}s 内不重复请求)",
+                "INFO",
+            )
+            return cached
 
         op_name = f"get_{endpoint}_correlation({alpha_id})"
         lock_info = await self._try_acquire_brain_correlation_lock(op_name)
@@ -5356,7 +5460,11 @@ class BrainApiClient:
             }
 
         try:
-            return await self._poll_platform_correlation(alpha_id, endpoint, label)
+            corr_data = await self._poll_platform_correlation(alpha_id, endpoint, label)
+            # Only a completed answer is cached (the helper ignores pending ones,
+            # which carry max=None) — a timeout must stay retryable.
+            self._set_cached_correlation(endpoint, alpha_id, corr_data)
+            return corr_data
         finally:
             await self._release_brain_correlation_lock(lock_info, op_name)
 
@@ -6291,6 +6399,10 @@ class BrainApiClient:
         concurrent with, or too soon after, another one fails fast with
         status='correlation_busy' and a retry_after instead of waiting. The
         ``self`` path is computed locally and is never gated.
+
+        Each finished production / power-pool answer is cached per alpha for 5
+        minutes (BRAIN_CORRELATION_CACHE_TTL_SECONDS), so re-checking the same
+        alpha within that window is free and never reports correlation_busy.
         """
         await self.ensure_authenticated()
 

@@ -201,6 +201,7 @@ python main.py
 | `BRAIN_CORRELATION_MAX_WAIT_SECONDS` | `3600` | 单次相关性检查的轮询总预算 |
 | `BRAIN_CORRELATION_POLL_MIN_SECONDS` | `5` | 轮询最小间隔；平台返回 `Retry-After: 1` 也不会低于此值 |
 | `BRAIN_CORRELATION_BUSY_RETRY_AFTER_SECONDS` | `180` | 拿不到槽位时返回给调用方的 `retry_after` 上限 |
+| `BRAIN_CORRELATION_CACHE_TTL_SECONDS` | `300` | 同一 alpha 的生产 / PPA 相关性结果缓存时长；窗口内重复查询不请求平台、不占槽位（设 0 关闭）|
 | `FORUM_SSO_TTL_SECONDS` | `1800` | Zendesk SSO 握手复用时长 |
 | `FORUM_POST_TTL_SECONDS` | `86400` | 论坛帖子（含评论）缓存时长 |
 
@@ -280,6 +281,12 @@ scope="best"          最佳 alpha
 **锁 TTL 与轮询预算的关系**：TTL 只是崩溃兜底，绝不能在持有者还在轮询时到期，所以代码里 TTL 会自动抬到不低于 `BRAIN_CORRELATION_MAX_WAIT_SECONDS + 300`。想把单次检查的等待放宽到 2 小时，只需调 `BRAIN_CORRELATION_MAX_WAIT_SECONDS=7200`，TTL 会自己变成 7500，无需手工同步。
 
 **注意**：持锁进程被 kill 时，键会带着 2 小时 TTL 留在 Redis 里，期间所有平台相关性检查都返回 busy。手动清除：`docker exec mcp-redis redis-cli --scan --pattern 'lock:brain_correlation*' | xargs -r docker exec -i mcp-redis redis-cli del`。
+
+**结果缓存 5 分钟**：一次检查算完后，结果按 `账号 × 端点 × alpha` 缓存 `BRAIN_CORRELATION_CACHE_TTL_SECONDS`（默认 300s）。窗口内再问同一个 alpha 的生产（或 PPA）相关性，**在取槽位之前**就直接返回缓存，既不发请求也不消耗槽位，因此也不会因为冷却而收到 `correlation_busy`。缓存结果带 `cached: True` 和 `cache_age_seconds`。
+
+- 生产和 PPA 是两个独立的键，同一个 alpha 的两种相关性互不覆盖。
+- 只缓存**算完**的结果（`max` 不为 None）；`pending`（轮询超时）和 `correlation_busy` 从不入缓存，仍然可以立刻重试。
+- 两层：进程内字典（Redis 宕机也有效）+ Redis 键 `corr_result:<账号哈希>:<prod|power-pool>:<alpha_id>`（覆盖其它 MCP 进程）。缓存被驱逐只是回落到重新请求，不像锁那样会出正确性问题。
 
 **自相关性不受此限制**：`check_self_correlation` 走本地 PnL 缓存计算，不碰这把锁，可以随便调。
 
