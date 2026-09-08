@@ -328,6 +328,37 @@ USA/TOP3000（249 个 OS alpha）实测：
 
 通过本服务提交 alpha 会立即让列表失效；**在浏览器里提交**的 alpha 最多 5 分钟后才进入对比池。若两边混用，把 `BRAIN_OS_LIST_TTL_SECONDS` 设为 `0`——每次都用探针校验，仍只需 1 个 4.5KB 的请求。
 
+### 全地区 alpha（REGION_AGNOSTIC / ARC2026）
+
+All Region Competition 2026 只给 **RA Parent** 类型、**delay 1** 的 alpha 计分（SuperAlpha 不计分）。平台为此在 `POST /simulations` 上新增了第三种 `type`，参数组合是唯一的：
+
+| 参数 | 取值 |
+| --- | --- |
+| `type` | `REGION_AGNOSTIC` |
+| `region` | `ALL`（其他地区码会被平台拒绝） |
+| `universe` | `LARGE` / `MEDIUM` / `SMALL` |
+| `delay` | 只有 `1` |
+| 表达式 | 走 `alpha_expression`（即 `regular`），与普通回测一致 |
+
+一次提交把同一个表达式在所有地区跑一遍：产出一个 `RA_PARENT` alpha，其 `children` 是每地区一个 `RA_CHILD`，各自带该地区的原生 universe 和自己的 IS 指标。`create_simulation` 的返回里 `ra_children` 把它们展开成每地区一行（`region` / `universe` / `alpha_id` / `stage` / `metrics`）——父 alpha 自己的数字看不出哪个地区跑通了。
+
+实测一条 `rank(-returns)`（ALL / LARGE / delay 1 / SUBINDUSTRY）：
+
+| 地区 | universe | Sharpe |
+| --- | --- | --- |
+| GLB | MINVOL1M | 1.95 |
+| EUR | TOP2500 | 1.91 |
+| USA | TOP3000 | 1.78 |
+| ASI | MINVOL1M | 1.17 |
+
+父 alpha 的 `MATCHES_COMPETITION` 检查直接返回 `ARC2026`，可据此确认这条确实计分。
+
+`create_multi_simulation` 同样接受 `type="REGION_AGNOSTIC"`，一次最多 10 个表达式。
+
+SUPER 专用的 `selection_handling` / `selection_limit` / `component_activation` 在这个类型下会被平台逐个报错，本服务已自动剔除。region / universe / delay 的组合在本地先校验，错了立刻报错并指出正确取值，不必等平台的 400。
+
+`get_platform_setting_options` 现在会一并返回 `simulation_types`，所以 `ALL` 这个地区对应哪种 type 是可发现的，不用猜。
+
 ### 模拟账本（回测去重）
 
 所有回测都经过本服务，所以每次完成的模拟都会记录到 `cache/simulations/ledger.jsonl`——表达式、settings、alpha_id、IS 指标。带来两件事：

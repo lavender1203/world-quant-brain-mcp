@@ -53,6 +53,11 @@ class AuthCredentials(BaseModel):
     email: EmailStr
     password: str
 
+# Universes the platform offers for region="ALL" (the region-agnostic bucket).
+# Source: OPTIONS /simulations -> settings.universe.choices.instrumentType.EQUITY.region.ALL
+_REGION_AGNOSTIC_UNIVERSES = {"LARGE", "MEDIUM", "SMALL"}
+
+
 class SimulationSettings(BaseModel):
     instrumentType: str = "EQUITY"
     region: str = "USA"
@@ -79,6 +84,44 @@ class SimulationData(BaseModel):
     regular: Optional[str] = None
     combo: Optional[str] = None
     selection: Optional[str] = None
+
+    @model_validator(mode="after")
+    def validate_region_agnostic_rules(self) -> "SimulationData":
+        """Fail a malformed all-region request here rather than at the platform.
+
+        A REGION_AGNOSTIC simulation is the "RA Parent" alpha the All Region
+        Competition scores. The platform accepts it on exactly one shape: region
+        ALL, delay 1, and a universe from the ALL bucket. Every other choice
+        comes back as a settings-level 400 several seconds later, so the same
+        rules are checked locally where the message can name the fix.
+        """
+        region = self.settings.region.upper()
+        if self.type.upper() != "REGION_AGNOSTIC":
+            if region == "ALL":
+                raise ValueError(
+                    f'region="ALL" is only available to type="REGION_AGNOSTIC"; got type="{self.type}". '
+                    'Set type="REGION_AGNOSTIC" to run one expression across every region.')
+            return self
+
+        if region != "ALL":
+            raise ValueError(
+                f'REGION_AGNOSTIC simulations require region="ALL"; got "{self.settings.region}". '
+                'A per-region code (USA, GLB, ASI, ...) is rejected by the platform for this type.')
+
+        if self.settings.universe.upper() not in _REGION_AGNOSTIC_UNIVERSES:
+            raise ValueError(
+                f'region="ALL" supports universe {sorted(_REGION_AGNOSTIC_UNIVERSES)}; '
+                f'got "{self.settings.universe}". Per-region universes such as TOP3000 do not exist here.')
+
+        if self.settings.delay != 1:
+            raise ValueError(
+                f'REGION_AGNOSTIC simulations only run at delay=1; got {self.settings.delay}. '
+                'The All Region Competition also scores delay-1 alphas only.')
+
+        if not self.regular:
+            raise ValueError('REGION_AGNOSTIC simulations require alpha_expression (sent as `regular`).')
+
+        return self
 
     @model_validator(mode="after")
     def validate_super_selection_rules(self) -> "SimulationData":
@@ -2297,6 +2340,47 @@ class BrainApiClient:
             self.log(f"Failed to get auth status: {str(e)}", "ERROR")
             return None
     
+    async def _resolve_ra_children(self, alpha: Dict[str, Any]) -> Optional[List[Dict[str, Any]]]:
+        """Expand an all-region parent alpha into one row per region.
+
+        A REGION_AGNOSTIC run yields an RA_PARENT alpha whose `children` are the
+        RA_CHILD alpha ids, one per region, each with its own native universe and
+        its own IS metrics (verified: USA/TOP3000, EUR/TOP2500, ASI/MINVOL1M,
+        GLB/MINVOL1M off one expression). The parent's own numbers say nothing
+        about which region actually worked, so the per-region rows are the
+        result worth reading. A child that cannot be read is reported rather
+        than dropped, so a partial answer never looks complete.
+        """
+        child_ids = alpha.get('children') or []
+        if not child_ids:
+            return None
+        rows: List[Dict[str, Any]] = []
+        for child_id in child_ids:
+            if not isinstance(child_id, str):
+                child_id = (child_id or {}).get('id') if isinstance(child_id, dict) else None
+            if not child_id:
+                continue
+            try:
+                child = await self.get_alpha_details(child_id)
+            except Exception as e:
+                rows.append({'alpha_id': child_id, 'error': str(e)})
+                continue
+            settings = child.get('settings') or {}
+            is_block = child.get('is') or {}
+            rows.append({
+                'alpha_id': child_id,
+                'type': child.get('type'),
+                'region': settings.get('region'),
+                'universe': settings.get('universe'),
+                'neutralization': settings.get('neutralization'),
+                'status': child.get('status'),
+                'stage': child.get('stage'),
+                'metrics': {k: is_block.get(k) for k in
+                            ('sharpe', 'fitness', 'turnover', 'returns', 'drawdown', 'margin')
+                            if is_block.get(k) is not None} or None,
+            })
+        return rows or None
+
     async def create_simulation(self, simulation_data: SimulationData,
                                 reuse_existing: bool = True) -> Dict[str, str]:
         """Create a new simulation on BRAIN platform.
@@ -2313,9 +2397,12 @@ class BrainApiClient:
             # Prepare settings based on simulation type
             settings_dict = simulation_data.settings.model_dump()
             
-            # Remove fields based on simulation type
-            if simulation_data.type == "REGULAR":
-                # Remove SUPER-specific fields for REGULAR
+            # Remove fields based on simulation type. selectionHandling,
+            # selectionLimit and componentActivation belong to SUPER alone: the
+            # platform rejects each one by name for REGULAR and for
+            # REGION_AGNOSTIC, so strip them for every non-SUPER type rather
+            # than for REGULAR only.
+            if simulation_data.type.upper() != "SUPER":
                 settings_dict.pop('selectionHandling', None)
                 settings_dict.pop('selectionLimit', None)
                 settings_dict.pop('componentActivation', None)
@@ -2329,8 +2416,11 @@ class BrainApiClient:
                 'settings': settings_dict
             }
             
-            # Add type-specific fields
-            if simulation_data.type == "REGULAR":
+            # Add type-specific fields. A REGION_AGNOSTIC simulation carries its
+            # expression in `regular` exactly like a REGULAR one; omitting it
+            # made the platform reject the request with "regular: This field is
+            # required."
+            if simulation_data.type.upper() in ("REGULAR", "REGION_AGNOSTIC"):
                 if simulation_data.regular:
                     payload['regular'] = simulation_data.regular
             elif simulation_data.type == "SUPER":
@@ -2361,8 +2451,13 @@ class BrainApiClient:
                             f"{datetime.fromtimestamp(prior.get('simulated_at') or 0):%Y-%m-%d %H:%M})",
                             "INFO",
                         )
+                        # A replayed all-region alpha must carry its per-region
+                        # children too, or the cheap path would answer with less
+                        # than the expensive one.
+                        replay_children = await self._resolve_ra_children(alpha)
                         return {
                             **alpha,
+                            **({'ra_children': replay_children} if replay_children else {}),
                             'from_local_ledger': True,
                             'previously_simulated_at': datetime.fromtimestamp(
                                 prior.get('simulated_at') or 0).isoformat(),
@@ -2465,6 +2560,9 @@ class BrainApiClient:
                     alpha = await self.get_alpha_details(alpha_id, force_refresh=True)
                     await self._ledger_record(fingerprint, payload, alpha)
                     await self.record_alpha_locally(alpha)
+                    ra_children = await self._resolve_ra_children(alpha)
+                    if ra_children:
+                        alpha = {**alpha, 'ra_children': ra_children}
                     return alpha
                 except (ConnectionError, TimeoutError) as e:
                     if alpha_attempt < max_poll_retries - 1:
@@ -6787,10 +6885,12 @@ class BrainApiClient:
         try:
             # Generate cache key (no parameters needed as this endpoint returns fixed platform settings)
             cache_key = self._generate_cache_key('platform_settings', {})
-            
-            # Try to get from cache
+
+            # Try to get from cache. An entry cached before REGION_AGNOSTIC
+            # existed carries no simulation_types key, and would keep hiding the
+            # all-region option for the rest of the long TTL, so treat it as a miss.
             cached_data = self._get_cached_data(cache_key)
-            if cached_data:
+            if cached_data and 'simulation_types' in cached_data:
                 return {**cached_data, 'from_cache': True}
             
             # Use OPTIONS method on simulations endpoint to get configuration options
@@ -6799,7 +6899,10 @@ class BrainApiClient:
             
             # Parse the settings structure from the response
             settings_data = response.json()
-            settings_options = settings_data['actions']['POST']['settings']['children']
+            post_action = settings_data['actions']['POST']
+            settings_options = post_action['settings']['children']
+            simulation_types = [c['value'] for c in
+                                (post_action.get('type') or {}).get('choices') or []]
             
             # Extract instrument configuration options
             instrument_type_data = {}
@@ -6845,6 +6948,11 @@ class BrainApiClient:
             result = {
                 'instrument_options': data_list,
                 'total_combinations': len(data_list),
+                # Region "ALL" only pairs with type REGION_AGNOSTIC, so the type
+                # list has to travel with the region/universe table or a caller
+                # sees ALL and has no way to know which type unlocks it.
+                'simulation_types': simulation_types,
+                'region_agnostic_type': 'REGION_AGNOSTIC' if 'REGION_AGNOSTIC' in simulation_types else None,
                 'instrument_types': [item['value'] for item in instrument_type_data],
                 'regions_by_type': {
                     item['value']: [r['value'] for r in region_data[item['value']]]
@@ -7194,6 +7302,13 @@ def _slim_alpha(a):
     out = {
         "id": a.get("id"),
         "code": code,
+        # RA_PARENT / RA_CHILD say this alpha came from an all-region run, and
+        # the child ids are the only route to the per-region results, so neither
+        # survives the slimming as noise.
+        "type": a.get("type") if a.get("type") not in (None, "REGULAR") else None,
+        "children": a.get("children"),
+        "parent": a.get("parent"),
+        "ra_children": a.get("ra_children"),
         "status": a.get("status"),
         "stage": a.get("stage"),
         "dateSubmitted": a.get("dateSubmitted"),
@@ -7726,11 +7841,23 @@ async def create_simulation(
     backtest — worth doing after a monthly data release, since new datafields
     can change a result (see whats_new_in_data).
     if field type=VECTOR should deal with vec_ suffer vec_*(FIELD)
+    ALL-REGION ALPHAS ("RA Parent", what the All Region Competition scores):
+    pass type="REGION_AGNOSTIC" with region="ALL", universe one of
+    LARGE/MEDIUM/SMALL, and delay=1. One expression is then backtested across
+    every region at once: the result is an RA_PARENT alpha, and `ra_children` in
+    the response lists each per-region RA_CHILD with its region, native universe,
+    alpha_id and IS metrics. No other region, universe or
+    delay is accepted for this type, and the SUPER-only settings
+    (selection_handling, selection_limit, component_activation) must not be sent
+    — this tool drops them for you.
+
     Args:
-        type: Simulation type ("REGULAR" or "SUPER")
-        region: Market region (e.g., "USA")
-        universe: Universe of stocks (e.g., "TOP3000")
-        delay: Data delay (0 or 1)
+        type: Simulation type ("REGULAR", "SUPER" or "REGION_AGNOSTIC")
+        region: Market region ("USA", "GLB", "EUR", "ASI", "CHN", "KOR", "HKG",
+            "IND", "DEU", "GBR", or "ALL" for REGION_AGNOSTIC)
+        universe: Universe of stocks (e.g., "TOP3000"; region "ALL" takes
+            "LARGE", "MEDIUM" or "SMALL")
+        delay: Data delay (0 or 1; region "ALL" is delay 1 only)
         decay: Decay value for the simulation
         neutralization: Neutralization method
         truncation: Truncation value
@@ -9051,6 +9178,7 @@ async def get_documentation_page(page_id: str) -> Dict[str, Any]:
 @mcp.tool()
 async def create_multi_simulation(
     alpha_expressions: List[str],
+    type: str = "REGULAR",
     instrument_type: str = "EQUITY",
     region: str = "USA",
     universe: str = "TOP3000",
@@ -9076,12 +9204,18 @@ async def create_multi_simulation(
     ⏰ NOTE: Multisimulations can take 8+ minutes to complete. This tool will wait
     for the entire process and return comprehensive results.
     Call get_platform_setting_options to get the valid options for the simulation.
+    ALL-REGION ALPHAS: pass type="REGION_AGNOSTIC" with region="ALL",
+    universe LARGE/MEDIUM/SMALL and delay=1 to batch the "RA Parent" alphas the
+    All Region Competition scores. Each expression then yields one RA_PARENT
+    alpha plus its per-region RA_CHILD alphas.
+
     Args:
         alpha_expressions: List of alpha expressions/code strings (2-10 expressions required)
+        type: Simulation type ("REGULAR" or "REGION_AGNOSTIC")
         instrument_type: Type of instruments (default: "EQUITY")
-        region: Market region (default: "USA")
-        universe: Universe of stocks (default: "TOP3000")
-        delay: Data delay (default: 1)
+        region: Market region (default: "USA"; use "ALL" for REGION_AGNOSTIC)
+        universe: Universe of stocks (default: "TOP3000"; region "ALL" takes LARGE/MEDIUM/SMALL)
+        delay: Data delay (default: 1; region "ALL" is delay 1 only)
         decay: Decay value (default: 4)
         neutralization: Neutralization method (default: "NONE")
         truncation: Truncation value (default: 0.0)
@@ -9103,6 +9237,22 @@ async def create_multi_simulation(
             return {"error": "At least 2 alpha expressions are required"}
         if len(alpha_expressions) > 10:
             return {"error": "Maximum 10 alpha expressions allowed per request"}
+
+        sim_type = type.upper()
+        if sim_type not in ("REGULAR", "REGION_AGNOSTIC"):
+            return {"error": f'type must be "REGULAR" or "REGION_AGNOSTIC"; got "{type}"'}
+        # The platform validates each item of the batch separately, so a settings
+        # mistake would cost a full round trip per expression. Check the
+        # all-region rules once, here.
+        if sim_type == "REGION_AGNOSTIC":
+            if region.upper() != "ALL":
+                return {"error": f'type="REGION_AGNOSTIC" requires region="ALL"; got "{region}"'}
+            if universe.upper() not in _REGION_AGNOSTIC_UNIVERSES:
+                return {"error": f'region="ALL" supports universe {sorted(_REGION_AGNOSTIC_UNIVERSES)}; got "{universe}"'}
+            if delay != 1:
+                return {"error": f'type="REGION_AGNOSTIC" only runs at delay=1; got {delay}'}
+        elif region.upper() == "ALL":
+            return {"error": 'region="ALL" is only available to type="REGION_AGNOSTIC"'}
 
         await brain_client.ensure_authenticated()
         normalized_language = language.upper()
@@ -9132,7 +9282,7 @@ async def create_multi_simulation(
                 settings['nanHandling'] = nan_handling
 
             simulation_item = {
-                'type': 'REGULAR',
+                'type': sim_type,
                 'settings': settings,
                 'regular': alpha_expr
             }
