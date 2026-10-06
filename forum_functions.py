@@ -5,6 +5,7 @@ Comprehensive forum functionality including glossary, search, and post viewing u
 """
 
 import asyncio
+import base64
 import re
 import sys
 import time
@@ -25,6 +26,7 @@ except ImportError:
 from bs4 import BeautifulSoup
 import requests
 import os
+from urllib.parse import parse_qs, quote, urlparse
 
 
 _BROWSER_PATH_CACHE = None
@@ -41,10 +43,31 @@ def _html_to_text(html: str) -> str:
     return '\n'.join(lines)
 
 
+def _unwrap_search_click_url(url: str) -> str:
+    """Return the real target URL behind a Zendesk search click-tracking link.
+
+    Search result titles link to ``/hc/<locale>/search/click?data=<b64>--<sig>``,
+    where ``data`` is a base64 Ruby Marshal hash holding the post's actual URL.
+    Anything that isn't such a link is returned unchanged.
+    """
+    if not isinstance(url, str) or '/search/click' not in url:
+        return url
+    try:
+        data = parse_qs(urlparse(url).query).get('data', [''])[0].split('--', 1)[0]
+        raw = base64.b64decode(data + '=' * (-len(data) % 4))
+        match = re.search(rb'https?://[\x21-\x7e]+', raw)
+        if match:
+            return match.group().decode('ascii')
+    except Exception:
+        pass
+    return url
+
+
 def _extract_post_id(post_url_or_id: str) -> str:
     """Extract numeric forum post id from a raw id, slug, or full URL."""
     if not post_url_or_id:
         raise ValueError("Forum post id is required")
+    post_url_or_id = _unwrap_search_click_url(post_url_or_id)
     match = re.search(r'/posts/(\d+)|^(\d+)', str(post_url_or_id))
     post_id = next((group for group in match.groups() if group), None) if match else None
     if not post_id:
@@ -55,6 +78,7 @@ def _extract_post_id(post_url_or_id: str) -> str:
 def _extract_locale(post_url_or_id: str, default: str = "zh-cn") -> str:
     """Extract forum locale from URL when present."""
     if isinstance(post_url_or_id, str):
+        post_url_or_id = _unwrap_search_click_url(post_url_or_id)
         match = re.search(r'/hc/([^/]+)/community/posts/', post_url_or_id)
         if match:
             return match.group(1)
@@ -526,7 +550,7 @@ class ForumClient:
                         max_pages = 5  # Limit pages to prevent infinite loops
                         
                         while len(search_results) < max_results and page_num <= max_pages:
-                            search_url = f"{self.base_url}/hc/{locale}/search?page={page_num}&query={search_query}#results"
+                            search_url = f"{self.base_url}/hc/{locale}/search?page={page_num}&query={quote(search_query)}#results"
                             log(f"Navigating to search page {page_num}: {search_url}", "INFO")
                             
                             try:
@@ -599,6 +623,7 @@ class ForumClient:
                                         snippet = snippet_element.get_text(strip=True) if snippet_element else ''
                                         
                                         full_link = ''
+                                        link = _unwrap_search_click_url(link)
                                         if link and isinstance(link, str):
                                             if link.startswith('http'):
                                                 full_link = link
