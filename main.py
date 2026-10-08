@@ -57,6 +57,26 @@ class AuthCredentials(BaseModel):
 # Source: OPTIONS /simulations -> settings.universe.choices.instrumentType.EQUITY.region.ALL
 _REGION_AGNOSTIC_UNIVERSES = {"LARGE", "MEDIUM", "SMALL"}
 
+# Source: OPTIONS /simulations -> settings.simulationMode.choices (default FULL).
+# QUICK returns PnL / Sharpe / fitness / turnover / IS ladder only: no
+# visualization, no Theme / Competition / correlation checks, and the alpha
+# cannot be submitted directly. FULL is the pre-existing behaviour.
+_SIMULATION_MODES = ("FULL", "QUICK")
+
+_QUICK_MODE_NOTE = (
+    'simulation_mode="QUICK": no visualization and no Theme / Competition / '
+    'correlation checks were run, so this alpha cannot be submitted directly. '
+    'Re-run the same expression with simulation_mode="FULL" before submit_alpha.')
+
+
+def _normalize_simulation_mode(mode: Optional[str]) -> str:
+    """Upper-case and validate a simulationMode value; unset means FULL."""
+    value = (mode or "FULL").strip().upper()
+    if value not in _SIMULATION_MODES:
+        raise ValueError(
+            f'simulation_mode must be one of {list(_SIMULATION_MODES)}; got "{mode}"')
+    return value
+
 
 class SimulationSettings(BaseModel):
     instrumentType: str = "EQUITY"
@@ -77,6 +97,16 @@ class SimulationSettings(BaseModel):
     selectionLimit: int = 1000
     maxTrade: str = "OFF"
     componentActivation: str = "IS"
+    simulationMode: str = "FULL"
+
+    @model_validator(mode="after")
+    def validate_simulation_mode(self) -> "SimulationSettings":
+        self.simulationMode = _normalize_simulation_mode(self.simulationMode)
+        # The platform documents QUICK as the pair simulationMode=QUICK +
+        # visualization=false; QUICK renders nothing, so the flag is forced off.
+        if self.simulationMode == "QUICK":
+            self.visualization = False
+        return self
 
 class SimulationData(BaseModel):
     type: str = "REGULAR"  # "REGULAR" or "SUPER"
@@ -2591,9 +2621,19 @@ class BrainApiClient:
 
     @staticmethod
     def _simulation_fingerprint(payload: Dict[str, Any]) -> str:
-        """Stable hash of a simulation request (type + settings + expression)."""
+        """Stable hash of a simulation request (type + settings + expression).
+
+        ``simulationMode`` was added after the ledger already held rows; FULL
+        is what every earlier request ran as, so it is dropped from the hash
+        and those rows keep matching. QUICK stays in: a QUICK alpha has no
+        checks and must never be replayed for a FULL request.
+        """
+        settings = dict(payload.get('settings') or {})
+        if settings.get('simulationMode', 'FULL') == 'FULL':
+            settings.pop('simulationMode', None)
+        canonical = {**payload, 'settings': settings}
         return hashlib.sha1(
-            json.dumps(payload, sort_keys=True, separators=(',', ':')).encode('utf-8')
+            json.dumps(canonical, sort_keys=True, separators=(',', ':')).encode('utf-8')
         ).hexdigest()
 
     def _ledger_path(self) -> Path:
@@ -7336,6 +7376,14 @@ def _slim_alpha_response(obj):
     return _rewrap(_slim_alpha(payload), w)
 
 
+def _annotate_quick_mode(obj):
+    """Mark a QUICK-mode result so nobody hands the alpha to submit_alpha as-is."""
+    payload, w = _unwrap_result(obj)
+    if _is_error(payload) or not isinstance(payload, dict):
+        return obj
+    return _rewrap({**payload, "simulation_mode": "QUICK", "quick_mode_note": _QUICK_MODE_NOTE}, w)
+
+
 def _slim_alpha_list(obj):
     payload, w = _unwrap_result(obj)
     if not isinstance(payload, dict) or "results" not in payload:
@@ -7828,9 +7876,17 @@ async def create_simulation(
     selection_limit: int = 1000,
     component_activation: str = "IS",
     reuse_existing: bool = True,
+    simulation_mode: str = "FULL",
 ) -> Dict[str, Any]:
     """
     Create a new simulation on BRAIN platform.
+
+    SIMULATION MODE: simulation_mode="QUICK" is for fast iteration. It returns
+    PnL, sub-universe PnL, weight concentration, fitness, IS ladder, Sharpe,
+    returns and turnover only: no visualization, no Theme / Competition /
+    correlation checks, and the alpha is NOT submittable directly. The default
+    "FULL" runs every check and is what a near-submission alpha needs. A QUICK
+    result never satisfies a later FULL request from the local ledger.
 
     This tool creates and starts a simulation with your alpha code. Use this after you have your alpha formula ready.
 
@@ -7870,6 +7926,8 @@ async def create_simulation(
         combo: Combo code (for SUPER type)
         selection: Selection code (for SUPER type). For USA SUPER simulations,
             this must include (prod_correlation > 0)
+        simulation_mode: "FULL" (default, all checks) or "QUICK" (fast, no
+            checks, not submittable directly)
     
     Returns:
         Simulation creation result with ID and location
@@ -7878,6 +7936,7 @@ async def create_simulation(
     visualization = False
     try:
         normalized_language = language.upper()
+        normalized_mode = _normalize_simulation_mode(simulation_mode)
         settings_kwargs = {
             "instrumentType": instrument_type,
             "region": region,
@@ -7894,6 +7953,7 @@ async def create_simulation(
             "selectionHandling": selection_handling,
             "selectionLimit": selection_limit,
             "componentActivation": component_activation,
+            "simulationMode": normalized_mode,
         }
 
         if normalized_language == "PYTHON":
@@ -7916,8 +7976,11 @@ async def create_simulation(
             selection=selection
         )
         
-        return _slim_alpha_response(
+        result = _slim_alpha_response(
             await brain_client.create_simulation(sim_data, reuse_existing=reuse_existing))
+        if normalized_mode == "QUICK":
+            result = _annotate_quick_mode(result)
+        return result
     except Exception as e:
         extra_info = ""
         error_msg = str(e)
@@ -9193,7 +9256,8 @@ async def create_multi_simulation(
     lookback: Optional[int] = None,
     visualization: bool = False,
     pasteurization: str = "ON",
-    max_trade: str = "OFF"
+    max_trade: str = "OFF",
+    simulation_mode: str = "FULL"
 ) -> Dict[str, Any]:
     """
     🚀 Create multiple regular alpha simulations on BRAIN platform in a single request.
@@ -9227,6 +9291,9 @@ async def create_multi_simulation(
         visualization: Enable visualization (default: False)
         pasteurization: Pasteurization setting (default: "ON")
         max_trade: Max trade setting (default: "OFF")
+        simulation_mode: "FULL" (default, all checks) or "QUICK" (fast feedback:
+            metrics only, no visualization / Theme / Competition / correlation
+            checks, alphas not submittable directly; visualization is forced off)
     
     Returns:
         Dictionary containing multisimulation results and individual alpha details
@@ -9241,6 +9308,12 @@ async def create_multi_simulation(
         sim_type = type.upper()
         if sim_type not in ("REGULAR", "REGION_AGNOSTIC"):
             return {"error": f'type must be "REGULAR" or "REGION_AGNOSTIC"; got "{type}"'}
+        try:
+            normalized_mode = _normalize_simulation_mode(simulation_mode)
+        except ValueError as e:
+            return {"error": str(e)}
+        if normalized_mode == "QUICK":
+            visualization = False
         # The platform validates each item of the batch separately, so a settings
         # mistake would cost a full round trip per expression. Check the
         # all-region rules once, here.
@@ -9272,7 +9345,8 @@ async def create_multi_simulation(
                 'language': normalized_language,
                 'visualization': visualization,
                 'testPeriod': test_period,
-                'maxTrade': max_trade
+                'maxTrade': max_trade,
+                'simulationMode': normalized_mode
             }
 
             if normalized_language == "PYTHON":
@@ -9303,7 +9377,10 @@ async def create_multi_simulation(
             return {"error": "No location header in multisimulation response"}
         
         # Wait for children to appear and get results
-        return _slim_multisim(await _wait_for_multisimulation_completion(location, len(alpha_expressions)))
+        result = _slim_multisim(await _wait_for_multisimulation_completion(location, len(alpha_expressions)))
+        if normalized_mode == "QUICK" and isinstance(result, dict) and not _is_error(result):
+            result = {**result, "simulation_mode": "QUICK", "quick_mode_note": _QUICK_MODE_NOTE}
+        return result
         
     except Exception as e:
         return {"error": f"Error creating multisimulation: {str(e)}"}
@@ -9437,8 +9514,12 @@ async def _wait_for_multisimulation_completion(location: str, expected_children:
 def _build_multisim_payload(alpha_expressions, instrument_type, region, universe,
                             delay, decay, neutralization, truncation, test_period,
                             unit_handling, nan_handling, language, lookback,
-                            visualization, pasteurization, max_trade):
+                            visualization, pasteurization, max_trade,
+                            simulation_mode="FULL"):
     normalized_language = language.upper()
+    normalized_mode = _normalize_simulation_mode(simulation_mode)
+    if normalized_mode == "QUICK":
+        visualization = False
     payload = []
     for alpha_expr in alpha_expressions:
         settings = {
@@ -9453,7 +9534,8 @@ def _build_multisim_payload(alpha_expressions, instrument_type, region, universe
             'language': normalized_language,
             'visualization': visualization,
             'testPeriod': test_period,
-            'maxTrade': max_trade
+            'maxTrade': max_trade,
+            'simulationMode': normalized_mode
         }
         if normalized_language == "PYTHON":
             settings['lookback'] = 256 if lookback is None else lookback
@@ -9482,25 +9564,32 @@ async def submit_multi_simulation(
     lookback: Optional[int] = None,
     visualization: bool = False,
     pasteurization: str = "ON",
-    max_trade: str = "OFF"
+    max_trade: str = "OFF",
+    simulation_mode: str = "FULL"
 ) -> Dict[str, Any]:
     """Stage 1/3: submit a multisimulation and return IMMEDIATELY (seconds).
 
     Returns {submitted, location, multisimulation_id} on success. On HTTP 429
     returns {error: "RATE_LIMITED", retry_after}. Poll the location with
     check_multi_simulation, then call fetch_multi_simulation_result.
-    Same parameters as create_multi_simulation.
+    Same parameters as create_multi_simulation, including simulation_mode
+    ("FULL" default; "QUICK" = metrics only, no checks, not submittable).
     """
     try:
         if len(alpha_expressions) < 2:
             return {"error": "At least 2 alpha expressions are required"}
         if len(alpha_expressions) > 10:
             return {"error": "Maximum 10 alpha expressions allowed per request"}
+        try:
+            normalized_mode = _normalize_simulation_mode(simulation_mode)
+        except ValueError as e:
+            return {"error": str(e)}
         await brain_client.ensure_authenticated()
         payload = _build_multisim_payload(
             alpha_expressions, instrument_type, region, universe, delay, decay,
             neutralization, truncation, test_period, unit_handling, nan_handling,
-            language, lookback, visualization, pasteurization, max_trade)
+            language, lookback, visualization, pasteurization, max_trade,
+            normalized_mode)
         response = await brain_client._request(
             'POST', f"{brain_client.base_url}/simulations", json=payload)
         if response.status_code == 429:
@@ -9524,6 +9613,8 @@ async def submit_multi_simulation(
             "location": location,
             "multisimulation_id": location.rstrip('/').split('/')[-1],
             "n_expressions": len(alpha_expressions),
+            "simulation_mode": normalized_mode,
+            **({"quick_mode_note": _QUICK_MODE_NOTE} if normalized_mode == "QUICK" else {}),
         }
     except Exception as e:
         return {"error": f"Error submitting multisimulation: {str(e)}"}

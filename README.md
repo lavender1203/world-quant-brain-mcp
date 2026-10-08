@@ -359,6 +359,22 @@ SUPER 专用的 `selection_handling` / `selection_limit` / `component_activation
 
 `get_platform_setting_options` 现在会一并返回 `simulation_types`，所以 `ALL` 这个地区对应哪种 type 是可发现的，不用猜。
 
+### Quick Mode / Full Mode
+
+平台在 settings 里新增了 `simulationMode`（`OPTIONS /simulations` 可见，取值 `FULL` / `QUICK`，默认 `FULL`）。`create_simulation` / `create_multi_simulation` / `submit_multi_simulation` 都接了 `simulation_mode` 参数：
+
+| | `FULL`（默认） | `QUICK` |
+| --- | --- | --- |
+| 用途 | 接近成型、准备提交的 alpha | 快速试错、批量筛想法 |
+| 结果 | 与之前完全一致 | PnL、子 universe PnL、权重集中度、Fitness、IS ladder、Sharpe、Returns、Turnover |
+| 可视化 | 有 | 无（本服务会强制 `visualization=false`，平台要求成对） |
+| Theme / Competition / 相关性 / Cluster 检查 | 有 | **没有** |
+| 能否直接提交 | 能 | **不能**，要用 `FULL` 重跑同一表达式 |
+
+QUICK 的返回带 `simulation_mode: "QUICK"` 和 `quick_mode_note`，避免下游直接拿它去 `submit_alpha`。
+
+账本指纹对 `FULL` 不敏感（这个字段出现之前跑的所有回测都是 FULL），所以旧账本继续命中；`QUICK` 参与指纹，一条 QUICK 结果永远不会被当作 FULL 请求的答案回放。
+
 ### 模拟账本（回测去重）
 
 所有回测都经过本服务，所以每次完成的模拟都会记录到 `cache/simulations/ledger.jsonl`——表达式、settings、alpha_id、IS 指标。带来两件事：
