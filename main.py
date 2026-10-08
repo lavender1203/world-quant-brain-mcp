@@ -6739,15 +6739,19 @@ class BrainApiClient:
                                    selection_description: Optional[str] = None,
                                    combo_description: Optional[str] = None
                                    ) -> Dict[str, Any]:
-        """Update alpha properties (name, color, tags, descriptions)."""
+        """Update alpha properties (name, color, tags, descriptions).
+
+        `PowerPoolSelected` is gated and preserved, see _apply_powerpool_tag_policy.
+        """
         await self.ensure_authenticated()
-        
+
         try:
             # todo: ra_failed_count 是否为0
+            tags, pp_gate = await self._apply_powerpool_tag_policy(alpha_id, tags)
             payload = {
                 "color": color,
                 "name": name,
-                "tags": tags if tags is not None else [],
+                "tags": tags,
                 "regular": {"description": descriptions}
             }
             if selection_description is not None:
@@ -6757,10 +6761,115 @@ class BrainApiClient:
             
             response = await self._request('PATCH', f"{self.base_url}/alphas/{alpha_id}", json=payload)
             response.raise_for_status()
-            return response.json()
+            result = response.json()
+            if pp_gate and isinstance(result, dict):
+                result["powerpool_gate"] = pp_gate
+            return result
         except Exception as e:
             self.log(f"Failed to set alpha properties: {str(e)}", "ERROR")
             raise
+
+    # Combined Power Pool Alpha Performance is region-equal-weighted and after-cost, so one
+    # below-break-even member drags a whole region (2026-08-30 / 2026-09-30: auto-tagged GLB
+    # members at 6-13bp margin pushed GLB's 1y combo to -0.3). Break-even margin per region is
+    # the calibrated fee model of osmomis/scripts/powerpool_simulator.py (18bp x 0.6 haircut x
+    # region factor 1.0 / 1.5 / 2.0); the add rule mirrors powerpool_region_optimize.py.
+    PP_TAG = "PowerPoolSelected"
+    PP_BREAKEVEN_BP = {"USA": 10.8, "EUR": 10.8, "MEA": 21.6}
+    PP_DEFAULT_BREAKEVEN_BP = 16.2
+    PP_MARGIN_OVER_BE_BP = 2.0
+    PP_MIN_SOLO_3Y = 0.6
+    PP_BOOK_SIZE = 20_000_000.0
+
+    @staticmethod
+    def _recordset_series(payload: Dict[str, Any], value_key: str) -> Dict[str, float]:
+        props = payload.get("properties") or [
+            p.get("name") for p in (payload.get("schema") or {}).get("properties", [])
+        ]
+        date_i, val_i = props.index("date"), props.index(value_key)
+        out: Dict[str, float] = {}
+        for rec in payload.get("records") or []:
+            try:
+                out[str(rec[date_i])] = float(rec[val_i])
+            except (TypeError, ValueError, IndexError):
+                continue
+        return dict(sorted(out.items()))
+
+    async def _powerpool_after_cost_solo_3y(self, alpha_id: str, region: str, fallback_turnover: float) -> float:
+        """After-cost annualized Sharpe over the last three calendar years of the IS PnL."""
+        pnl = self._recordset_series(await self.get_record_set_data(alpha_id, "pnl"), "pnl")
+        try:
+            turnover = self._recordset_series(await self.get_record_set_data(alpha_id, "turnover"), "turnover")
+        except Exception:
+            turnover = {}
+        if len(pnl) < 60:
+            raise ValueError(f"only {len(pnl)} pnl records")
+        dates = list(pnl)
+        start = f"{int(dates[-1][:4]) - 2}-01-01"
+        cost_rate = self.PP_BREAKEVEN_BP.get(region, self.PP_DEFAULT_BREAKEVEN_BP) / 10_000.0
+        vec = [
+            pnl[d] - pnl[p] - self.PP_BOOK_SIZE * turnover.get(d, fallback_turnover) * cost_rate
+            for p, d in zip(dates, dates[1:]) if d >= start
+        ]
+        mean = sum(vec) / len(vec)
+        std = math.sqrt(sum((v - mean) ** 2 for v in vec) / (len(vec) - 1))
+        if std == 0:
+            raise ValueError("flat pnl")
+        return mean / std * math.sqrt(252.0)
+
+    async def _apply_powerpool_tag_policy(self, alpha_id: str,
+                                          tags: Optional[List[str]]) -> Tuple[List[str], Optional[Dict[str, Any]]]:
+        """Resolve the tag list to PATCH (the platform replaces the whole list).
+
+        - tags=None keeps the alpha's current tags instead of wiping them.
+        - An existing PowerPoolSelected is never removed here: membership is curated by the
+          osmomis Power Pool scripts, and whole-list overwrites were silently undoing it.
+        - A NEW PowerPoolSelected on a REGULAR alpha is added only if it is compensated
+          (prodCorrelation > 0), margin >= region break-even + 2bp and after-cost solo Sharpe
+          over the last 3 IS years >= 0.6; otherwise it is dropped (fail closed) and the
+          rest of the update still goes through.
+        """
+        current = await self.get_alpha_details(alpha_id, force_refresh=True)
+        current_tags = list(current.get("tags") or [])
+        if tags is None:
+            return current_tags, None
+        tags = list(dict.fromkeys(tags))
+        if self.PP_TAG in current_tags:
+            if self.PP_TAG not in tags:
+                tags.append(self.PP_TAG)
+                return tags, {"action": "kept", "reason": "existing PowerPoolSelected is curated elsewhere; not removed"}
+            return tags, None
+        if self.PP_TAG not in tags or current.get("type") != "REGULAR":
+            return tags, None
+
+        isd = current.get("is") or {}
+        region = (current.get("settings") or {}).get("region")
+        be = self.PP_BREAKEVEN_BP.get(region, self.PP_DEFAULT_BREAKEVEN_BP)
+        margin_bp = (isd.get("margin") or 0.0) * 10_000.0
+        prod_corr = isd.get("prodCorrelation")
+        gate: Dict[str, Any] = {"region": region, "margin_bp": round(margin_bp, 1),
+                                "required_margin_bp": be + self.PP_MARGIN_OVER_BE_BP,
+                                "prodCorrelation": prod_corr, "required_solo_3y": self.PP_MIN_SOLO_3Y}
+        fails = []
+        if not prod_corr:
+            fails.append("prodCorrelation missing or 0 (non-compensated alphas cannot be Power Pool members)")
+        if margin_bp < be + self.PP_MARGIN_OVER_BE_BP:
+            fails.append(f"margin {margin_bp:.1f}bp < {region} break-even {be}bp + {self.PP_MARGIN_OVER_BE_BP}bp")
+        if not fails:
+            try:
+                solo = await self._powerpool_after_cost_solo_3y(alpha_id, region, isd.get("turnover") or 0.0)
+                gate["after_cost_solo_3y"] = round(solo, 2)
+                if solo < self.PP_MIN_SOLO_3Y:
+                    fails.append(f"after-cost solo Sharpe (last 3y) {solo:.2f} < {self.PP_MIN_SOLO_3Y}")
+            except Exception as e:
+                fails.append(f"after-cost solo Sharpe unavailable ({e})")
+        if fails:
+            tags.remove(self.PP_TAG)
+            gate.update(action="rejected", reasons=fails)
+        else:
+            gate["action"] = "added"
+        self.log(f"PowerPool tag gate {alpha_id}: {gate}", "INFO")
+        return tags, gate
 
     async def get_record_sets(self, alpha_id: str, force_refresh: bool = False) -> Dict[str, Any]:
         """List available record sets for an alpha (a fixed set of five names)."""
@@ -8835,6 +8944,10 @@ async def set_alpha_properties(alpha_id: str, name: Optional[str] = None,
         name: 使用生产相关性和自相关性命名，不能带空格；建议基于 correlation
         的最大值命名，例如 `0.6534_0.2306` 表示 prod correlation = 0.6534, self correlation = 0.2306；
         tags 如果alpha质量非常好可以设置 `PowerPoolSelected`，质量不好或不好判断就不要设置tag；
+        服务端会对新加的 `PowerPoolSelected` 做硬门槛（REGULAR、prodCorrelation>0、
+        margin ≥ 区域盈亏线+2bp（USA/EUR 12.8、MEA 23.6、其他 18.2bp）、近3年费后 solo Sharpe ≥ 0.6），
+        不达标会被去掉并在返回的 `powerpool_gate` 里说明原因；已有的 `PowerPoolSelected` 不会被移除；
+        tags 不传时保留原有标签（平台是整表替换）；
         descriptions: Write in English, <=100 words. The three sections MUST be separated by
         actual newline characters (i.e. use the JSON escape sequence \\n\\n between sections,
         NOT the literal text "\\n\\n"). Example value:
@@ -8861,8 +8974,13 @@ async def set_alpha_properties(alpha_id: str, name: Optional[str] = None,
         # backslash-n as two characters rather than a true newline escape.
         if descriptions and descriptions != "None":
             descriptions = descriptions.replace('\\n', '\n')
-        return _slim_alpha_response(await brain_client.set_alpha_properties(alpha_id, name, color, tags, descriptions,
-                                                       selection_description, combo_description))
+        result = await brain_client.set_alpha_properties(alpha_id, name, color, tags, descriptions,
+                                                         selection_description, combo_description)
+        gate = result.pop("powerpool_gate", None) if isinstance(result, dict) else None
+        slim = _slim_alpha_response(result)
+        if gate and isinstance(slim, dict):
+            slim["powerpool_gate"] = gate
+        return slim
     except Exception as e:
         return {"error": f"An unexpected error occurred: {str(e)}"}
 
