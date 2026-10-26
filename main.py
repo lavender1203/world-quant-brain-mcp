@@ -6780,6 +6780,8 @@ class BrainApiClient:
     PP_MARGIN_OVER_BE_BP = 2.0
     PP_MIN_SOLO_3Y = 0.6
     PP_BOOK_SIZE = 20_000_000.0
+    # 2026-10-09 user rule (BRAIN official: this universe's OS is poor as a whole); applies to every alpha type.
+    PP_BANNED_UNIVERSES = {"ILLIQUID_MINVOL1M"}
 
     @staticmethod
     def _recordset_series(payload: Dict[str, Any], value_key: str) -> Dict[str, float]:
@@ -6839,7 +6841,16 @@ class BrainApiClient:
                 tags.append(self.PP_TAG)
                 return tags, {"action": "kept", "reason": "existing PowerPoolSelected is curated elsewhere; not removed"}
             return tags, None
-        if self.PP_TAG not in tags or current.get("type") != "REGULAR":
+        if self.PP_TAG not in tags:
+            return tags, None
+        universe = (current.get("settings") or {}).get("universe")
+        if universe in self.PP_BANNED_UNIVERSES:
+            tags.remove(self.PP_TAG)
+            gate = {"universe": universe, "action": "rejected",
+                    "reasons": [f"universe {universe} is banned from Power Pool (poor OS as a whole)"]}
+            self.log(f"PowerPool tag gate {alpha_id}: {gate}", "INFO")
+            return tags, gate
+        if current.get("type") != "REGULAR":
             return tags, None
 
         isd = current.get("is") or {}
