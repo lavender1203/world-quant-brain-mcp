@@ -6546,8 +6546,8 @@ class BrainApiClient:
 
         # Greedy maximal mutually-below-threshold subset: consider nodes in
         # ascending order of average |correlation| (least entangled first), keep
-        # a node only if it is < threshold vs every already-kept node. This is a
-        # heuristic (max independent set is NP-hard) but gives a good basket.
+        # a node only if it is < threshold vs every already-kept node. It seeds
+        # the exact search below and is the answer if that search runs out of budget.
         if len(cols) > 1:
             avg_abs = {
                 o: sum(abs(cval(o, p)) for p in cols if p != o) / (len(cols) - 1)
@@ -6560,6 +6560,7 @@ class BrainApiClient:
         for oid in order:
             if all(abs(cval(oid, k)) < threshold for k in kept):
                 kept.append(oid)
+        kept, subset_exact = self._max_mutually_below_subset(order, cval, threshold, kept)
 
         # Unknown entries stay None in the matrix so a consumer cannot mistake
         # "could not be computed" for "uncorrelated".
@@ -6591,9 +6592,57 @@ class BrainApiClient:
             'unknown_pairs': unknown_pairs,
             'max_mutually_below_subset': kept,
             'max_mutually_below_subset_size': len(kept),
+            # False: the exact search hit its step budget and this is the best found so far.
+            'max_mutually_below_subset_exact': subset_exact,
             'missing_pnl': missing,
             'local_calculation': True,
         }
+
+    @staticmethod
+    def _max_mutually_below_subset(
+        order: List[str],
+        cval,
+        threshold: float,
+        seed: List[str],
+        max_steps: int = 200_000,
+    ) -> Tuple[List[str], bool]:
+        """Largest subset whose members are all pairwise |corr| < ``threshold``.
+
+        Branch-and-bound maximum clique on the "below threshold" graph, starting
+        from the greedy ``seed`` so the result is never smaller than it. Among
+        equally large subsets the one with the lowest total pairwise |corr| wins.
+        Returns (subset, exact); exact is False when ``max_steps`` ran out first.
+        """
+        adj = {a: {b for b in order if b != a and abs(cval(a, b)) < threshold} for a in order}
+
+        def cost(s: List[str]) -> float:
+            return sum(abs(cval(a, b)) for i, a in enumerate(s) for b in s[i + 1:])
+
+        best, best_cost = list(seed), cost(seed)
+        steps = 0
+        exhausted = False
+
+        def expand(cur: List[str], cand: List[str]):
+            nonlocal best, best_cost, steps, exhausted
+            steps += 1
+            if steps > max_steps:
+                exhausted = True
+                return
+            if not cand:
+                if len(cur) > len(best) or (len(cur) == len(best) and cost(cur) < best_cost):
+                    best, best_cost = list(cur), cost(cur)
+                return
+            for i, v in enumerate(cand):
+                # Even taking every remaining candidate cannot reach the best size.
+                if len(cur) + len(cand) - i < len(best):
+                    return
+                expand(cur + [v], [w for w in cand[i + 1:] if w in adj[v]])
+                if exhausted:
+                    return
+
+        expand([], list(order))
+        chosen = set(best)
+        return [o for o in order if o in chosen], not exhausted
 
     async def check_self_correlation(
         self,
@@ -9011,8 +9060,10 @@ async def compute_mutual_correlation(
     Returns:
         Dict with: matrix (NxN), max_pair (most-correlated pair),
         pairs_over_threshold, all_below_threshold (bool), and
-        max_mutually_below_subset (a greedy maximal basket whose members are all
-        mutually below threshold), plus missing_pnl for any unfetchable ids.
+        max_mutually_below_subset (the largest basket whose members are all
+        mutually below threshold; max_mutually_below_subset_exact is False if the
+        search hit its budget and fell back to the best found), plus missing_pnl
+        for any unfetchable ids.
     """
     try:
         return await brain_client.get_mutual_correlation(alpha_ids, threshold=threshold, years=years)
